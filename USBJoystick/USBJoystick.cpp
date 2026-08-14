@@ -19,6 +19,7 @@
  
 #include "stdint.h"
 #include "USBJoystick.h"
+#include "EndpointResolver.h"
 
 #include "config.h"  // Pinscape configuration
 
@@ -618,7 +619,28 @@ bool USBJoystick::updateStatus(uint32_t status)
 }
 
 void USBJoystick::_init() {
- 
+
+   // Resolve the keyboard endpoints now, not at SET_CONFIGURATION.
+   //
+   // The host reads the configuration descriptor first, and that descriptor
+   // has to name the endpoint addresses. _kb_in and _kb_out were still 0 at
+   // that point, so the keyboard interface advertised endpoint 0 and Linux
+   // rejected it: "couldn't find an input interrupt endpoint". Nothing warned
+   // about it, because endpoint_add() takes an address rather than handing
+   // one out -- under mbed 2 the numbers were fixed constants (EP1, EP4) and
+   // there was nothing to resolve.
+   //
+   // Replay the base class's allocation exactly -- control, then the joystick
+   // pair -- so those keep the addresses USBHID gave them, then take a pair
+   // for the keyboard.
+   EndpointResolver resolver(endpoint_table());
+   resolver.endpoint_ctrl(64);
+   resolver.endpoint_in(USB_EP_TYPE_INT, MAX_HID_REPORT_SIZE);
+   resolver.endpoint_out(USB_EP_TYPE_INT, MAX_HID_REPORT_SIZE);
+   _kb_in = resolver.endpoint_in(USB_EP_TYPE_INT, MAX_REPORT_KB_TX + 1);
+   _kb_out = resolver.endpoint_out(USB_EP_TYPE_INT, MAX_REPORT_KB_RX + 1);
+   MBED_ASSERT(resolver.valid());
+
    _x = 0;                       
    _y = 0;     
    _z = 0;
