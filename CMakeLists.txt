@@ -45,6 +45,13 @@ include(mbed_project_setup)
 add_subdirectory(custom_targets)
 add_subdirectory(mbed-os)
 
+# The Kinetis USB driver does not compile as shipped, and reserves 2 KB of RAM
+# for an endpoint this device never uses. Both are fixed on a generated copy;
+# see cmake/patch_usb_phy.cmake for why it cannot be done any other way.
+set(MBED_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/mbed-os)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch_usb_phy.cmake)
+pinscape_patch_usb_phy()
+
 # The firmware, as one executable. The original had no notion of libraries:
 # every driver lives in its own folder and is compiled straight into the image,
 # so the layout here follows the source rather than imposing structure on it.
