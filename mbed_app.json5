@@ -18,7 +18,17 @@
             // It pairs with TEST_KEEP_PRINTF in config.h, which frees PTA1/PTA2
             // for the UART. Without both, output would drive pins wired to
             // something else.
-            "target.console-uart": true
+            "target.console-uart": true,
+
+            // printf without floating point or 64-bit integers.
+            //
+            // Mbed enables both by default, and each drags its own formatting
+            // code into the image. Nothing this firmware prints needs them: the
+            // only %f are under DEBUG_PRINTF, which is off. Turn either back on
+            // if you enable that, and watch the flash budget.
+            "platform.minimal-printf-enable-floating-point": false,
+            "platform.minimal-printf-enable-64-bit": false,
+            "platform.stdio-minimal-console-only": true
         }
     }
 }

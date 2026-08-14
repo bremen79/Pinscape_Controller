@@ -142,6 +142,10 @@ endif()
 # which is exactly what these wrappers do.
 target_link_options(${PROJECT_NAME} PRIVATE -Wl,--wrap=malloc -Wl,--wrap=free)
 
+# Link-time optimisation, on trial.
+target_compile_options(${PROJECT_NAME} PRIVATE -flto)
+target_link_options(${PROJECT_NAME} PRIVATE -flto)
+
 mbed_set_post_build(${PROJECT_NAME})
 
 # Rewrite the image without .heap.
