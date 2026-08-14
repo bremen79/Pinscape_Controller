@@ -7,6 +7,7 @@
 #define USBJOYSTICK_H
  
 #include "USBHID.h"
+#include "usb_phy_api.h"
 #include "circbuf.h"
 
 // Bufferd incoming LedWiz message structure
@@ -114,7 +115,17 @@ public:
      */
     USBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release, 
         int waitForConnect, bool enableJoystick, int axisFormat, bool useKB)
-        : USBHID(16, 64, vendor_id, product_id, product_release, false)
+        // Mbed OS 6 reordered these: the first parameter of the simple
+        // constructor is connect_blocking, not the report length, so the mbed 2
+        // argument list silently mapped 16 onto a bool, the vendor id onto an
+        // 8-bit report length, and shifted the ids along by one.
+        //
+        // A derived class must use the USBPhy form regardless.  The other one
+        // connects during the base constructor, before this class's vtable
+        // exists, so the device would answer descriptor requests with USBHID's
+        // own -- not the joystick/LedWiz ones.  We call connect() below, once
+        // the object is whole.
+        : USBHID(get_usb_phy(), 16, 64, vendor_id, product_id, product_release)
     { 
         _init();
         this->useKB = useKB;
@@ -356,14 +367,29 @@ public:
      */
     bool buttons(uint32_t buttons);
 
-    /* USB descriptor overrides */
-    virtual const uint8_t *configurationDesc();
+    /* USB descriptor overrides
+     *
+     * Mbed OS 6 renamed every one of these, so the mbed 2 spellings below
+     * silently stopped overriding anything: the device answered with USBHID's
+     * own descriptors and enumerated as "mbed.org HID DEVICE", a generic HID
+     * rather than a joystick.
+     */
+    virtual const uint8_t *configuration_desc(uint8_t index);
     virtual const uint8_t *reportDesc(int idx, uint16_t &len);
 
     /* USB descriptor string overrides */
-    virtual const uint8_t *stringImanufacturerDesc();
-    virtual const uint8_t *stringIserialDesc();
-    virtual const uint8_t *stringIproductDesc();
+    virtual const uint8_t *string_imanufacturer_desc();
+    virtual const uint8_t *string_iserial_desc();
+    virtual const uint8_t *string_iproduct_desc();
+
+    /* Serve the right report descriptor for each interface.
+     *
+     * USBHID::callback_request answers REPORT_DESCRIPTOR from report_desc(),
+     * which takes no interface: it assumes a device has exactly one HID
+     * interface. This one has two -- joystick/LedWiz and keyboard -- so the
+     * request is routed here by wIndex before falling back to the base class.
+     */
+    virtual void callback_request(const setup_packet_t *setup);
      
     /* set/get idle time */
     virtual void setIdleTime(int ifc, int rptid, int t)

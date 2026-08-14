@@ -779,6 +779,30 @@ static const uint8_t reportDescriptorLW[] =
 };
 
 
+// Answer GET_DESCRIPTOR(REPORT) for whichever interface asked.
+//
+// The base class serves report_desc(), which knows nothing about interfaces.
+// With the keyboard enabled this device has two, and the host asks for each
+// one by number in wIndex; sending the joystick descriptor for both would
+// leave the keyboard interface describing keys it does not have.
+void USBJoystick::callback_request(const setup_packet_t *setup)
+{
+    if (setup->bmRequestType.Type == STANDARD_TYPE
+        && setup->bRequest == GET_DESCRIPTOR
+        && DESCRIPTOR_TYPE(setup->wValue) == REPORT_DESCRIPTOR)
+    {
+        uint16_t len = 0;
+        const uint8_t *desc = reportDesc(setup->wIndex, len);
+        if (desc != NULL && len != 0)
+        {
+            complete_request(Send, (uint8_t *)desc, len);
+            return;
+        }
+    }
+
+    USBHID::callback_request(setup);
+}
+
 const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len) 
 {    
     switch (idx)
@@ -817,7 +841,7 @@ const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
     }
 } 
  
- const uint8_t *USBJoystick::stringImanufacturerDesc() {
+ const uint8_t *USBJoystick::string_imanufacturer_desc() {
     static const uint8_t stringImanufacturerDescriptor[] = {
         0x0E,                                            /* bLength */
         STRING_DESCRIPTOR,                               /* bDescriptorType 0x03 (String Descriptor) */
@@ -826,7 +850,7 @@ const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
     return stringImanufacturerDescriptor;
 }
 
-const uint8_t *USBJoystick::stringIserialDesc() 
+const uint8_t *USBJoystick::string_iserial_desc() 
 {
     // set up a buffer with space for the length prefix byte, descriptor type
     // byte, and serial number (as a wide-character string)
@@ -881,7 +905,7 @@ const uint8_t *USBJoystick::stringIserialDesc()
     return buf;
 }
 
-const uint8_t *USBJoystick::stringIproductDesc() {
+const uint8_t *USBJoystick::string_iproduct_desc() {
     static const uint8_t stringIproductDescriptor[] = {
         0x28,                                                       /*bLength*/
         STRING_DESCRIPTOR,                                          /*bDescriptorType 0x03*/
@@ -894,8 +918,13 @@ const uint8_t *USBJoystick::stringIproductDesc() {
 
 #define DEFAULT_CONFIGURATION (1)
 
-const uint8_t *USBJoystick::configurationDesc() 
+const uint8_t *USBJoystick::configuration_desc(uint8_t index) 
 {
+    // One configuration only; Mbed OS 6 asks by index and expects NULL past
+    // the end.
+    if (index != 0)
+        return NULL;
+
     // mbed 2's USBHID offered reportDescLength(index); the new one has no
     // index, since it assumes a single report descriptor. Pinscape has two —
     // joystick and keyboard — and its own reportDesc() already hands back the
