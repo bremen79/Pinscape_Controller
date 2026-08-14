@@ -347,7 +347,15 @@ const char *getOpenSDAID()
     static const char OpenSDA[] = OPENSDA_PREFIX "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0///";
     const size_t OpenSDA_prefix_length = sizeof(OPENSDA_PREFIX) - 1;
     
-    return OpenSDA + OpenSDA_prefix_length;
+    // The TUID is written into the .bin after linking, so the zeroes the
+    // compiler sees above are not what sits in flash at run time.  GCC is
+    // entitled to propagate them into every use of this pointer, which would
+    // make the board report an empty ID no matter what the tool patched in.
+    // Hiding the pointer's origin forces a real load.  ARM Compiler did not
+    // need this, which is why the original had no such precaution.
+    const char *p = OpenSDA + OpenSDA_prefix_length;
+    __asm__ volatile ("" : "+r"(p));
+    return p;
 }
 
 // --------------------------------------------------------------------------
@@ -5369,7 +5377,7 @@ bool saveConfigToFlash(int tFollowup, bool reboot)
 // that it's empty by virtue of not containing the required '66' byte
 // prefix for the first 8-byte variable block.
 static const uint8_t hostLoadedConfig[8192+32]
-    __attribute__ ((aligned(SECTOR_SIZE))) =
+    __attribute__ ((aligned(SECTOR_SIZE), used)) =
     "///Pinscape.HostLoadedConfig//\0\040";   // 30 byte signature + 2 byte length
 
 // Get a pointer to the first byte of the configuration data
@@ -5377,7 +5385,15 @@ const uint8_t *getHostLoadedConfigData()
 {
     // the first configuration variable byte immediately follows the
     // 32-byte signature header
-    return hostLoadedConfig + 32;
+    //
+    // The same barrier as getOpenSDAID(), for the same reason and with more at
+    // stake.  Without it GCC sees a const array it knows to be zero, concludes
+    // the '== 66' test in loadHostLoadedConfig() can never be true, drops the
+    // loop, then drops the 8 KB array itself as unreferenced -- so the config
+    // signature vanished from the .bin and the host had nowhere to write.
+    const uint8_t *p = hostLoadedConfig + 32;
+    __asm__ volatile ("" : "+r"(p));
+    return p;
 };
 
 // forward reference to config var store function
@@ -7056,7 +7072,15 @@ void handleInputMsg(LedWizMsg &lwm, USBJoystick &js, Accel &accel)
 int main(void)
 {
     // say hello to the debug console, in case it's connected
+    // Under the firmware's own TEST_KEEP_PRINTF=0 default, config.h reassigns
+    // PTA1/PTA2 -- the console UART pins -- as ordinary output ports, so this
+    // banner would drive pins that are wired to something else.  Honour that
+    // switch here, as the two other debug printf()s already honour DEBUG_PRINTF.
+    // It also keeps BufferedSerial, SerialBase and minimal-printf out of the
+    // image entirely, which mbed 2 never linked in the first place.
+#if TEST_KEEP_PRINTF
     printf("\r\nPinscape Controller starting\r\n");
+#endif
     
     // clear the I2C connection
     Accel::clear_i2c();

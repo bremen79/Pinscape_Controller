@@ -1,19 +1,24 @@
 {
     "target_overrides": {
         "*": {
-            // By default, use a serial baudrate of 115200 and enable buffering on the serial port.
-            "platform.stdio-baud-rate": 115200,
-            "platform.stdio-buffered-serial": 1,
-
             // Pinscape has no threads: mbed 2 had no RTOS at all, and the
             // KL25Z has 16 KB of RAM. With RTX linked in, the static data
             // overflowed the reserved region by 2312 bytes.
-            "target.application-profile": "bare-metal"
-        },
+            "target.application-profile": "bare-metal",
 
-        "NUCLEO_F070RB": {
-            "target.application-profile": "bare-metal"
+            // No console.
+            //
+            // Under the firmware's own TEST_KEEP_PRINTF=0 default, config.h
+            // reassigns PTA1/PTA2 -- the console UART pins -- as ordinary
+            // output ports, so anything written to stdout would drive pins
+            // wired to something else entirely.
+            //
+            // mbed 2 linked no serial support unless the program asked for it.
+            // Mbed OS retargets stdout onto a UART by default instead, which
+            // pulled in BufferedSerial, SerialBase, minimal-printf and the
+            // retarget layer: 5.7 KB of flash and 820 bytes of RAM, on a part
+            // where the image already sits at 98% of flash.
+            "target.console-uart": false
         }
-    },
-
+    }
 }

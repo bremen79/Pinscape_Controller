@@ -11,6 +11,24 @@
 cmake_minimum_required(VERSION 3.19)
 cmake_policy(VERSION 3.19...3.22)
 
+# Mbed CE defaults to the Develop profile (-Og -g3), which does not fit: it
+# overflows the flash region by 3732 bytes. There is no room on this part for
+# anything but -Os, so choose it rather than letting the build fail on a linker
+# error that says nothing about why.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build profile" FORCE)
+endif()
+
+# This firmware runs on one board and one board only, so there is no reason to
+# make every build spell out -DMBED_TARGET. The Pinscape target derives from
+# KL25Z; see custom_targets/custom_targets.json5.
+if(NOT MBED_TARGET)
+    set(MBED_TARGET PINSCAPE_KL25Z CACHE STRING "Mbed target")
+endif()
+if(NOT MBED_TOOLCHAIN)
+    set(MBED_TOOLCHAIN GCC_ARM CACHE STRING "Mbed toolchain")
+endif()
+
 set(MBED_APP_JSON_PATH mbed_app.json5)
 
 # The stock KL25Z target does not enable USB device support; see the comment in
@@ -137,3 +155,13 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
             $<TARGET_FILE:${PROJECT_NAME}> $<TARGET_FILE_DIR:${PROJECT_NAME}>/${PROJECT_NAME}.hex
     VERBATIM
     COMMENT "Removing the non-NOLOAD .heap section from the image")
+
+# The saved configuration lives in the top sectors of flash, where the linker
+# will happily place code instead. sizeof(NVM) is 1212, so it takes two 1 KB
+# sectors; keep those free.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+            -DIMAGE=$<TARGET_FILE_DIR:${PROJECT_NAME}>/${PROJECT_NAME}.bin
+            -DFLASH_SIZE=131072 -DRESERVED=2048
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check_flash_budget.cmake
+    VERBATIM)
