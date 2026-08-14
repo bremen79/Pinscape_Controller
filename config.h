@@ -42,7 +42,23 @@
 // the firmware.  Use the Config Tool on your Windows PC instead.
 #define STANDARD_CONFIG       1     // standard settings, based on v1 base settings
 #define TEST_CONFIG_EXPAN     0     // configuration for the expansion boards
-#define TEST_KEEP_PRINTF      0     // for debugging purposes, keep printf() enabled
+#define TEST_KEEP_PRINTF      1     // for debugging purposes, keep printf() enabled
+//
+// Turned on in this port, where the original shipped it off.
+//
+// It is what makes the board debuggable at all: the KL25Z's console UART
+// runs to the OpenSDA chip and comes out as a serial port on the host, and
+// that trace is how the USB faults in this port were found -- the board was
+// otherwise completely silent, with no debugger attached.
+//
+// It costs 1264 bytes of flash, 16 bytes of static RAM, and 1 KB of pool for
+// the stdio buffer, which the reclaimed isochronous endpoint buffer more than
+// covers (see cmake/patch_usb_phy.cmake).
+//
+// The one visible difference: with printf enabled, config.h keeps PTA1/PTA2
+// free for the UART, so output ports 1 and 2 default to NC instead of those
+// pins. That only affects a board running factory defaults -- any loaded
+// configuration assigns the ports itself.
                                     // by leaving the SDA UART GPIO pins unallocated
 
 // Plunger type codes

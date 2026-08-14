@@ -6,19 +6,19 @@
             // overflowed the reserved region by 2312 bytes.
             "target.application-profile": "bare-metal",
 
-            // No console.
+            // Keep the console.
             //
-            // Under the firmware's own TEST_KEEP_PRINTF=0 default, config.h
-            // reassigns PTA1/PTA2 -- the console UART pins -- as ordinary
-            // output ports, so anything written to stdout would drive pins
-            // wired to something else entirely.
+            // Mbed OS retargets stdout onto a UART, which costs 1264 bytes of
+            // flash and a 1 KB stdio buffer -- mbed 2 linked no serial support
+            // unless asked. It is kept here anyway: on the KL25Z that UART
+            // reaches the host through the OpenSDA chip, and it is the only way
+            // to see anything at all on a board with no debugger. Every USB
+            // fault in this port was found down that wire.
             //
-            // mbed 2 linked no serial support unless the program asked for it.
-            // Mbed OS retargets stdout onto a UART by default instead, which
-            // pulled in BufferedSerial, SerialBase, minimal-printf and the
-            // retarget layer: 5.7 KB of flash and 820 bytes of RAM, on a part
-            // where the image already sits at 98% of flash.
-            "target.console-uart": false
+            // It pairs with TEST_KEEP_PRINTF in config.h, which frees PTA1/PTA2
+            // for the UART. Without both, output would drive pins wired to
+            // something else.
+            "target.console-uart": true
         }
     }
 }
