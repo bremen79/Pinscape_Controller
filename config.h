@@ -1,3 +1,7 @@
+// Pin names below come from mbed; the online compiler included this
+// globally, so the header never had to ask for it.
+#include "mbed.h"
+
 // Pinscape Controller Configuration
 //
 // !!! ATTENTION !!! 

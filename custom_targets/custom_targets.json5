@@ -1,0 +1,20 @@
+{
+    /*
+       KL25Z with USB device support switched on.
+
+       Mbed CE ships the Kinetis USB driver and names this board explicitly in
+       its guard (targets/TARGET_Freescale/USBPhy_Kinetis.cpp: TARGET_KL25Z is
+       the first target listed), but the stock KL25Z entry does not list
+       USBDEVICE in its device_has, so drivers/usb is never built and
+       USBHID.h cannot be found. The two got out of step somewhere between
+       generations.
+
+       Pinscape exists to present a USB device, so it cannot build without it.
+       This target inherits everything from the stock KL25Z and only adds the
+       missing capability.
+    */
+    "PINSCAPE_KL25Z": {
+        "inherits": ["KL25Z"],
+        "device_has_add": ["USBDEVICE"],
+    },
+}

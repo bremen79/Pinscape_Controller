@@ -1,0 +1,19 @@
+{
+    "target_overrides": {
+        "*": {
+            // By default, use a serial baudrate of 115200 and enable buffering on the serial port.
+            "platform.stdio-baud-rate": 115200,
+            "platform.stdio-buffered-serial": 1,
+
+            // Pinscape has no threads: mbed 2 had no RTOS at all, and the
+            // KL25Z has 16 KB of RAM. With RTX linked in, the static data
+            // overflowed the reserved region by 2312 bytes.
+            "target.application-profile": "bare-metal"
+        },
+
+        "NUCLEO_F070RB": {
+            "target.application-profile": "bare-metal"
+        }
+    },
+
+}

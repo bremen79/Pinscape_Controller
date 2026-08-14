@@ -8,7 +8,7 @@
 // 
 // IRProtocol base class implementation
 //
-CircBuf<DebugItem,256> debug;
+CircBuf<DebugItem,256> irDebugLog;
 
 // Look up a protocol by ID
 IRProtocol *IRProtocol::senderForId(int id)

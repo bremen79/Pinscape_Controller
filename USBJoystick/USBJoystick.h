@@ -83,6 +83,12 @@ enum JOY_BUTTON {
  */
  
  
+// Maximum report sizes. Mbed OS 6 hands read_start() a buffer of the
+// caller's own, so the class needs these where its members are declared.
+const int MAX_REPORT_JS_RX = 8;
+const int MAX_REPORT_KB_TX = 8;
+const int MAX_REPORT_KB_RX = 4;
+
 class USBJoystick: public USBHID 
 {
 public:
@@ -114,7 +120,9 @@ public:
         this->useKB = useKB;
         this->enableJoystick = enableJoystick;
         this->axisFormat = axisFormat;
-        connect(waitForConnect);
+        // Mbed OS 6 dropped the blocking flag; state is reported by callback.
+        (void)waitForConnect;
+        connect();
     };
 
     /* read a report from the LedWiz buffer */
@@ -387,12 +395,24 @@ public:
     }
      
     /* callback overrides */
-    virtual bool USBCallback_setConfiguration(uint8_t configuration);
-    virtual bool USBCallback_setInterface(uint16_t interface, uint8_t alternate)
-        { return interface == 0 || interface == 1; }
-        
-    virtual bool EP1_OUT_callback();
-    virtual bool EP4_OUT_callback();
+
+    // Endpoints are added here. The base class handles the joystick/LedWiz
+    // pair; the keyboard pair is ours, since USBHID manages only one.
+    virtual void callback_set_configuration(uint8_t configuration) override;
+
+    // Both interfaces are ours, and neither has alternate settings.
+    virtual void callback_set_interface(uint16_t interface, uint8_t alternate) override
+        { (void)interface; (void)alternate; }
+
+    // A report arrived on the joystick/LedWiz endpoint. Was EP1_OUT_callback,
+    // which had to do its own reading; the base class reads it now.
+    virtual void report_rx() override;
+
+    // Transfer completions on the keyboard endpoints. mbed 2 named callbacks
+    // after endpoint numbers; they are registered per endpoint now.
+    void _kb_send_isr();
+    void _kb_read_isr();
+
      
 private:
 
@@ -410,6 +430,18 @@ private:
     
     // keyboard maximum idle time between reports
     uint8_t kbIdleTime;
+
+    // Endpoints for the keyboard interface. USBHID provides one pair of its
+    // own for the joystick; the keyboard is a second interface on this same
+    // device, so its pair is ours to allocate and to feed. Both stay unused
+    // when useKB is false, which is the case on a board whose buttons are all
+    // joystick buttons.
+    usb_ep_t _kb_in = 0;
+    usb_ep_t _kb_out = 0;
+
+    // Reception buffer for the keyboard endpoint. read_start() needs somewhere
+    // to put a packet before the callback runs.
+    uint8_t _kb_out_buf[MAX_REPORT_KB_RX + 1] = { 0 };
     
     // media maximum idle time between reports
     uint8_t mediaIdleTime;

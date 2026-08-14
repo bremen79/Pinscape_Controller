@@ -24,11 +24,14 @@
 
 
 
-// Maximum report sizes
 const int MAX_REPORT_JS_TX = USBJoystick::reportLen;
-const int MAX_REPORT_JS_RX = 8;
-const int MAX_REPORT_KB_TX = 8;
-const int MAX_REPORT_KB_RX = 4;
+
+// The interrupt endpoints are full speed, so 64 bytes is their ceiling.
+// mbed 2 spelled this MAX_PACKET_SIZE_EPINT.
+const int MAX_PACKET_SIZE_EPINT = 64;
+
+// The remaining report sizes now live in the header: the class declares receive
+// buffers of these sizes, so they have to be visible where it is defined.
 
 bool USBJoystick::update(int16_t x, int16_t y, int16_t z, int16_t z0, int16_t vx, int16_t vy, int16_t vz, uint32_t buttons, uint16_t status) 
 {
@@ -104,7 +107,7 @@ bool USBJoystick::update()
    report.length = reportLen;
  
    // send the report
-   return sendTO(&report, 100);
+   return send(&report);
 }
 
 bool USBJoystick::kbUpdate(uint8_t data[8])
@@ -116,7 +119,8 @@ bool USBJoystick::kbUpdate(uint8_t data[8])
     report.length = 9;                  // length = ID prefix + kb report length
     
     // send it to endpoint 4 (the keyboard interface endpoint)
-    return writeTO(EP4IN, report.data, report.length, MAX_PACKET_SIZE_EPINT, 100);
+    write_start(_kb_in, report.data, report.length);
+    return true;
 }
 
 bool USBJoystick::mediaUpdate(uint8_t data)
@@ -128,7 +132,8 @@ bool USBJoystick::mediaUpdate(uint8_t data)
     report.length = 2;
     
     // send it
-    return writeTO(EP4IN, report.data, report.length, MAX_PACKET_SIZE_EPINT, 100);
+    write_start(_kb_in, report.data, report.length);
+    return true;
 }
  
 bool USBJoystick::sendPlungerStatus(int npix, int plungerPos, int flags, 
@@ -181,7 +186,7 @@ bool USBJoystick::sendPlungerStatus(int npix, int plungerPos, int flags,
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::sendPlungerStatus2(
@@ -232,7 +237,7 @@ bool USBJoystick::sendPlungerStatus2(
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::sendPlungerStatusBarcode(
@@ -270,7 +275,7 @@ bool USBJoystick::sendPlungerStatusBarcode(
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::sendPlungerStatusQuadrature(int chA, int chB)
@@ -292,7 +297,7 @@ bool USBJoystick::sendPlungerStatusQuadrature(int chA, int chB)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::sendPlungerStatusVCNL4010(int filteredProxCount, int rawProxCount)
@@ -314,7 +319,7 @@ bool USBJoystick::sendPlungerStatusVCNL4010(int filteredProxCount, int rawProxCo
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 
@@ -337,7 +342,7 @@ bool USBJoystick::sendPlungerPix(int &idx, int npix, const uint8_t *pix)
         report.data[ofs] = (idx < npix ? pix[idx++] : 0);
     
     // send the report
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::reportID(int index)
@@ -376,7 +381,7 @@ bool USBJoystick::reportID(int index)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::reportBuildInfo(const char *date)
@@ -420,7 +425,7 @@ bool USBJoystick::reportBuildInfo(const char *date)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::reportConfigVar(const uint8_t *data)
@@ -440,7 +445,7 @@ bool USBJoystick::reportConfigVar(const uint8_t *data)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::reportConfig(
@@ -493,7 +498,7 @@ bool USBJoystick::reportConfig(
 
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 // report physical button status
@@ -517,7 +522,7 @@ bool USBJoystick::reportButtonStatus(int numButtons, const uint8_t *state)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 // report raw IR timing codes (for learning mode)
@@ -544,7 +549,7 @@ bool USBJoystick::reportRawIR(int n, const uint16_t *data)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::reportRawBytes(const uint8_t *data, size_t len)
@@ -552,7 +557,7 @@ bool USBJoystick::reportRawBytes(const uint8_t *data, size_t len)
     HID_REPORT report;
     report.length = reportLen;
     memcpy(report.data, data, len < reportLen ? len : reportLen);
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 // report a decoded IR command
@@ -576,7 +581,7 @@ bool USBJoystick::reportIRCode(uint8_t pro, uint8_t flags, uint64_t code)
         
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return send(&report);
 }
 
 bool USBJoystick::move(int16_t x, int16_t y) 
@@ -609,7 +614,7 @@ bool USBJoystick::updateStatus(uint32_t status)
    report.length = reportLen;
  
    // send the report
-   return sendTO(&report, 100);
+   return send(&report);
 }
 
 void USBJoystick::_init() {
@@ -891,8 +896,13 @@ const uint8_t *USBJoystick::stringIproductDesc() {
 
 const uint8_t *USBJoystick::configurationDesc() 
 {
-    int rptlen0 = reportDescLength(0);
-    int rptlen1 = reportDescLength(1);
+    // mbed 2's USBHID offered reportDescLength(index); the new one has no
+    // index, since it assumes a single report descriptor. Pinscape has two —
+    // joystick and keyboard — and its own reportDesc() already hands back the
+    // length, so ask it.
+    uint16_t rptlen0 = 0, rptlen1 = 0;
+    reportDesc(0, rptlen0);
+    reportDesc(1, rptlen1);
     if (useKB)
     {
         const int cfglenKB = 
@@ -935,7 +945,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_IN),          // bEndpointAddress - EPINT == EP1
+            _int_in,          // bEndpointAddress - EPINT == EP1
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -943,7 +953,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_OUT),         // bEndpointAddress - EPINT == EP1
+            _int_out,         // bEndpointAddress - EPINT == EP1
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -957,7 +967,7 @@ const uint8_t *USBJoystick::configurationDesc()
             0x02,                           // bNumEndpoints
             HID_CLASS,                      // bInterfaceClass
             HID_SUBCLASS_BOOT,              // bInterfaceSubClass
-            HID_PROTOCOL_KB,                // bInterfaceProtocol
+            HID_PROTOCOL_KEYBOARD,                // bInterfaceProtocol
             0x00,                           // iInterface
         
             HID_DESCRIPTOR_LENGTH,          // bLength
@@ -972,7 +982,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EP4IN),             // bEndpointAddress
+            _kb_in,             // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -980,7 +990,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EP4OUT),            // bEndpointAddress
+            _kb_out,            // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -1033,7 +1043,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_IN),          // bEndpointAddress
+            _int_in,          // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -1041,7 +1051,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_OUT),         // bEndpointAddress
+            _int_out,         // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -1054,29 +1064,43 @@ const uint8_t *USBJoystick::configurationDesc()
 
 // Set the configuration.  We need to set up the endpoints for
 // our active interfaces.
-bool USBJoystick::USBCallback_setConfiguration(uint8_t configuration) 
+void USBJoystick::callback_set_configuration(uint8_t configuration)
 {
-    // we only have one valid configuration
+    // The base class owns the joystick/LedWiz pair: it adds both endpoints and
+    // arms reception on the OUT one. Doing it here as well would add them twice.
+    USBHID::callback_set_configuration(configuration);
+
     if (configuration != DEFAULT_CONFIGURATION)
-        return false;
-        
-    // Configure endpoint 1 - we use this in all cases, for either
-    // the combined joystick/ledwiz interface or just the ledwiz interface
-    addEndpoint(EPINT_IN, MAX_REPORT_JS_TX + 1);
-    addEndpoint(EPINT_OUT, MAX_REPORT_JS_RX + 1);
-    readStart(EPINT_OUT, MAX_REPORT_JS_TX + 1);
-    
-    // if the keyboard is enabled, configure endpoint 4 for the kb interface
+        return;
+
+    // The keyboard interface is a second pair on top, when any button is set up
+    // as a key. mbed 2 named these endpoints; they are allocated now, so the
+    // addresses come from the resolver in the constructor.
     if (useKB)
     {
-        addEndpoint(EP4IN, MAX_REPORT_KB_TX + 1);
-        addEndpoint(EP4OUT, MAX_REPORT_KB_RX + 1);
-        readStart(EP4OUT, MAX_REPORT_KB_TX + 1);
+        endpoint_add(_kb_in, MAX_REPORT_KB_TX + 1, USB_EP_TYPE_INT,
+                     &USBJoystick::_kb_send_isr);
+        endpoint_add(_kb_out, MAX_REPORT_KB_RX + 1, USB_EP_TYPE_INT,
+                     &USBJoystick::_kb_read_isr);
+        read_start(_kb_out, _kb_out_buf, MAX_REPORT_KB_RX + 1);
     }
-
-    // success
-    return true;
 }
+
+// Completion of a keyboard IN transfer. Nothing to do but let the endpoint go:
+// the reports are fire-and-forget, as they were under the old writeTO().
+void USBJoystick::_kb_send_isr()
+{
+    write_finish(_kb_in);
+}
+
+// A packet arrived on the keyboard OUT endpoint. The old EP4_OUT_callback did
+// the same thing: take it, and arm the next read.
+void USBJoystick::_kb_read_isr()
+{
+    read_finish(_kb_out);
+    read_start(_kb_out, _kb_out_buf, MAX_REPORT_KB_RX + 1);
+}
+
 
 // Handle incoming messages on the joystick/LedWiz interface = endpoint 1.
 // This interface receives LedWiz protocol commands and commands using our
@@ -1087,36 +1111,29 @@ bool USBJoystick::USBCallback_setConfiguration(uint8_t configuration)
 // from the interrupt handler using the rule that only the interrupt 
 // handler can change the write pointer, and only the regular code can
 // change the read pointer.
-bool USBJoystick::EP1_OUT_callback()
+// A report arrived on the joystick/LedWiz OUT endpoint.
+//
+// The base class reads it and calls this, where mbed 2 handed over the endpoint
+// and left the draining to us. The circular buffer still crosses the interrupt
+// boundary the same way: only this handler moves the write pointer, only the
+// main loop moves the read pointer.
+//
+// The keyboard OUT endpoint carried indicator-LED updates that were read only
+// to keep the pipe open; _kb_read_isr does that now, and discards them as
+// before.
+void USBJoystick::report_rx()
 {
-    // Read this message
-    union {
+    HID_REPORT report;
+    if (!read_nb(&report))
+        return;
+
+    // A LedWiz message is exactly eight bytes; anything else is not one.
+    if (report.length == 8)
+    {
         LedWizMsg msg;
-        uint8_t buf[MAX_HID_REPORT_SIZE];
-    } buf;
-    uint32_t bytesRead = 0;
-    USBDevice::readEP(EP1OUT, buf.buf, &bytesRead, MAX_HID_REPORT_SIZE);
-    
-    // if it's the right length, queue it to our circular buffer
-    if (bytesRead == 8)
-        lwbuf.write(buf.msg);
-
-    // start the next read
-    return readStart(EP1OUT, MAX_HID_REPORT_SIZE);
+        memcpy(&msg, report.data, sizeof(msg));
+        lwbuf.write(msg);
+    }
 }
 
-// Handle incoming messages on the keyboard interface = endpoint 4.
-// The host uses this to send updates for the keyboard indicator LEDs
-// (caps lock, num lock, etc).  We don't do anything with these, but
-// we have to read them to keep the pipe open.
-bool USBJoystick::EP4_OUT_callback() 
-{
-    // read this message
-    uint32_t bytesRead = 0;
-    uint8_t led[MAX_HID_REPORT_SIZE];
-    USBDevice::readEP(EP4OUT, led, &bytesRead, MAX_HID_REPORT_SIZE);
-
-    // start the next read
-    return readStart(EP4OUT, MAX_HID_REPORT_SIZE);
-}
 

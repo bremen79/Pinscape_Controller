@@ -507,9 +507,9 @@ public:
         // Make sure the sensor has had time to finish initializing.
         // Power-up time (tCF) from the data sheet is 20ms for the 12-bit
         // version, 50ms for the 10-bit version.
-        wait_ms(nDataBits == 12 ? 20 :
+        wait_us((nDataBits == 12 ? 20 :
             nDataBits == 10 ? 50 :
-            50);
+            50) * 1000);
     }
 
     // read the angle

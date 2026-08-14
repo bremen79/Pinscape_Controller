@@ -65,7 +65,7 @@ void IRReceiver::startPulse(bool newPulseState)
     timeout.detach();
     
     // Set a new pulse timeout for the maximum pulse length
-    timeout.attach_us(this, &IRReceiver::pulseTimeout, MAX_PULSE);
+    timeout.attach_us(callback(this, &IRReceiver::pulseTimeout), MAX_PULSE);
 }
 
 // End the current pulse

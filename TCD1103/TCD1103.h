@@ -394,7 +394,7 @@ protected:
         uint32_t dtNext = dtInt < tIntMin ? tIntMin - dtInt : 1;
         
         // Schedule the next transfer
-        integrationTimeout.attach_us(this, &TCD1103::startTransfer, dtNext);
+        integrationTimeout.attach_us(callback(this, &TCD1103::startTransfer), dtNext);
     }
 
     // Generate an SH/ICG pulse.  This transfers the pixel data from the live

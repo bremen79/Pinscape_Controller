@@ -308,7 +308,8 @@
 // 
 // placement new
 //
-void* operator new (size_t, void *p) { return p; }
+// Placement new comes from <new> these days; defining it again is an error.
+#include <new>
 
 
 // --------------------------------------------------------------------------
@@ -399,7 +400,8 @@ inline int square(int x) { return x*x; }
 inline float square(float x) { return x*x; }
 
 // floating point rounding
-inline float round(float x) { return x > 0 ? floor(x + 0.5) : ceil(x - 0.5); }
+// Was round(): the standard library now provides one, and the two collide.
+inline float roundToNearest(float x) { return x > 0 ? floor(x + 0.5) : ceil(x - 0.5); }
 
 
 // --------------------------------------------------------------------------
@@ -4019,7 +4021,7 @@ public:
                 __disable_irq();
                 if (uint32_t(timer_.read_us() - lastSleepTime_) > 5000)
                 {
-                    connect(false);
+                    connect();
                     reconnectPending_ = false;
                     done = true;
                 }
@@ -5416,7 +5418,7 @@ uint8_t tReportPlungerStat;     // timestamp of most recent plunger status reque
 //
 
 // Turn night mode on or off
-static void setNightMode(bool on)
+void setNightMode(bool on)
 {
     // Set the new night mode flag in the noisy output class.  Note
     // that we use the status report bit flag value 0x02 when on, so
@@ -5440,7 +5442,7 @@ static void setNightMode(bool on)
 }
 
 // Toggle night mode
-static void toggleNightMode()
+void toggleNightMode()
 {
     setNightMode(!nightMode);
 }

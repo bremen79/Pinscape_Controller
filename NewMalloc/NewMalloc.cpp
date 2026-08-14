@@ -70,13 +70,17 @@ void HaltOutOfMem()
 // memory; this isn't universal, but it's very typical.
 
 extern "C" {
-    void *$Sub$$malloc(size_t);
-    void *$Super$$malloc(size_t);
-    void $Sub$$free(void *);
+    // ARM Compiler intercepted a library function with $Sub$$ and reached the
+    // original with $Super$$. GCC spells the same thing --wrap=malloc, which
+    // renames the calls to __wrap_malloc and leaves __real_malloc pointing at
+    // the library one. See the link options in CMakeLists.txt.
+    void *__wrap_malloc(size_t);
+    void *__real_malloc(size_t);
+    void __wrap_free(void *);
 };
 
 // override the system malloc
-void *$Sub$$malloc(size_t siz)
+void *__wrap_malloc(size_t siz)
 {
     return xmalloc(siz);
 }
@@ -93,7 +97,7 @@ void *xmalloc(size_t siz)
     {
         // do a dummy allocation with the system malloc() to find where
         // the free pool starts
-        xmalloc_nxt = (char *)$Super$$malloc(4);
+        xmalloc_nxt = (char *)__real_malloc(4);
         
         // figure the amount of space we can use - we have from the base
         // of the pool to the top of RAM, minus an allowance for the stack
@@ -124,3 +128,10 @@ size_t mallocBytesFree()
     return xmalloc_rem;
 }
 
+
+// Freeing does nothing, as it always has here. Blocks are carved out of the
+// pool below the heap, so handing one to the system allocator would corrupt
+// it. Pinscape allocates what it needs at startup and never gives it back.
+void __wrap_free(void *)
+{
+}
