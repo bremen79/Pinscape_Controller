@@ -118,3 +118,22 @@ endif()
 target_link_options(${PROJECT_NAME} PRIVATE -Wl,--wrap=malloc -Wl,--wrap=free)
 
 mbed_set_post_build(${PROJECT_NAME})
+
+# Rewrite the image without .heap.
+#
+# The KL25Z linker script declares `.heap :` where every other Mbed target
+# declares `.heap (NOLOAD) :`, so the section is marked LOAD and given a load
+# address past the end of the program. objcopy then dutifully writes it out:
+# 13468 bytes of zeroes that pushed the .bin to 140288, past the 128 KB of
+# flash on the part, for a firmware that actually ends at 126820. Flashing that
+# image would run off the end of the device.
+#
+# Only the output is corrected here — the symbols the heap allocator uses
+# (__end__, __HeapLimit) come from the linker script and are untouched.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_OBJCOPY} -O binary --remove-section=.heap
+            $<TARGET_FILE:${PROJECT_NAME}> $<TARGET_FILE_DIR:${PROJECT_NAME}>/${PROJECT_NAME}.bin
+    COMMAND ${CMAKE_OBJCOPY} -O ihex --remove-section=.heap
+            $<TARGET_FILE:${PROJECT_NAME}> $<TARGET_FILE_DIR:${PROJECT_NAME}>/${PROJECT_NAME}.hex
+    VERBATIM
+    COMMENT "Removing the non-NOLOAD .heap section from the image")
