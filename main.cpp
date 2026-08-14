@@ -5408,9 +5408,15 @@ void loadHostLoadedConfig()
     // the USB protocol, so each block starts with a byte value of
     // 66 and is 8 bytes long.  Continue as long as we find valid
     // variable blocks, or reach end end of the block.
-    const uint8_t *start = getHostLoadedConfigData();
+    //
+    // Note: the bounds test compares the pointer that actually moves.  This
+    // read used to test 'start < end' with a 'start' that never advanced, so
+    // it could never fail and the loop stopped only on finding a byte that is
+    // not 66.  That holds while the area has room to spare -- the unused tail
+    // is zeroed, which ends the loop -- but filling all 1024 slots would let
+    // it run off the end of the array.  Require a whole record to remain.
     const uint8_t *end = hostLoadedConfig + sizeof(hostLoadedConfig);
-    for (const uint8_t *p = getHostLoadedConfigData() ; start < end && *p == 66 ; p += 8)
+    for (const uint8_t *p = getHostLoadedConfigData() ; p + 8 <= end && *p == 66 ; p += 8)
     {
         // load this variable
         configVarSet(p);
