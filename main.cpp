@@ -301,6 +301,7 @@
 
 
 #define DECL_EXTERNS
+#include "Version.h"
 #include "config.h"
 
 
@@ -436,7 +437,20 @@ private:
 // 
 // USB product version number
 //
-const uint16_t USB_VERSION_NO = 0x000A;
+// USB device release number -- the bcdDevice field of the device descriptor.
+//
+// This is the standard place for a firmware version, and it costs nothing to
+// fill in: it sits beside iManufacturer and iProduct in the same descriptor,
+// so a host reads all three from one enumeration. hidapi surfaces it as
+// hid_device_info::release_number, and SDL as SDL_GetJoystickFirmwareVersion().
+// A version is only meaningful next to the name of the thing being versioned,
+// and that is exactly where this one lands.
+//
+// BCD, two digits of major and two of minor, so 2.1.0 reads as 0x0210. The
+// patch level shares the low byte; it is there for completeness rather than to
+// be relied on, since 16 bits cannot hold three independent components.
+const uint16_t USB_VERSION_NO =
+    static_cast<uint16_t>((VERSION_MAJOR << 8) | (VERSION_MINOR << 4) | VERSION_PATCH);
 
 // --------------------------------------------------------------------------
 //
@@ -3868,8 +3882,8 @@ class MyUSBJoystick: public USBJoystick
 {
 public:
     MyUSBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release,
-        bool waitForConnect, bool enableJoystick, int axisFormat, bool useKB) 
-        : USBJoystick(vendor_id, product_id, product_release, waitForConnect, enableJoystick, axisFormat, useKB)
+        uint8_t accelRangeG, bool waitForConnect, bool enableJoystick, int axisFormat, bool useKB) 
+        : USBJoystick(vendor_id, product_id, product_release, accelRangeG, waitForConnect, enableJoystick, axisFormat, useKB)
     {
         sleeping_ = false;
         reconnectPending_ = false;
@@ -7203,7 +7217,15 @@ int main(void)
     // above) to set up the interface, since the button setup will determine
     // whether or not we need to present a USB keyboard interface in addition
     // to the joystick interface.
-    MyUSBJoystick js(cfg.usbVendorID, cfg.usbProductID, USB_VERSION_NO, false, 
+    // The reported accelerometer full scale, in g, so the report descriptor can
+    // publish what its axis counts mean. Derived from the configured range
+    // rather than the hardware one: the 1 g setting runs the chip at 2 g and
+    // halves the readings.
+    const uint8_t accelRangeG =
+        cfg.accel.range == AccelRange1G ? 1 :
+        cfg.accel.range == AccelRange2G ? 2 :
+        cfg.accel.range == AccelRange4G ? 4 : 8;
+    MyUSBJoystick js(cfg.usbVendorID, cfg.usbProductID, USB_VERSION_NO, accelRangeG, false, 
         cfg.joystickEnabled, cfg.joystickAxisFormat, kbKeys);
         
     // start the request timestamp timer
@@ -7663,8 +7685,7 @@ int main(void)
                                static_cast<int16_t>(x), static_cast<int16_t>(y),
                                static_cast<int16_t>(vx), static_cast<int16_t>(vy),
                                static_cast<int16_t>(zReported),
-                               static_cast<int16_t>(zvReported),
-                               accel.reportedRangeInG());
+                               static_cast<int16_t>(zvReported));
                 }
             }
             

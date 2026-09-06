@@ -664,7 +664,7 @@ void USBJoystick::_init() {
 //
 // USB HID Report Descriptor - Joystick
 //
-static const uint8_t reportDescriptorJS[] = 
+static uint8_t reportDescriptorJS[] = 
 {         
     USAGE_PAGE(1), 0x01,            // Generic desktop
     USAGE(1), 0x04,                 // Joystick
@@ -690,18 +690,52 @@ static const uint8_t reportDescriptorJS[] =
         UNIT(1), 0x00,              // Unit (None)                                           
         INPUT(1), 0x02,             // Data, Variable, Absolute
        
+        // The axes, in two runs so that the two carrying the accelerometer can
+        // declare what their counts mean.
+        //
+        // A host otherwise has no way to know: -4096..+4096 is a range, not a
+        // unit, and the same board reports +/-1 g or 2, 4 or 8 depending on how
+        // its owner configured it. Pinball software works around that by asking
+        // the user, and gets it wrong by a factor of two, four or eight when the
+        // user does not know either.
+        //
+        // HID has said how to express this since the beginning: PHYSICAL_MINIMUM
+        // and PHYSICAL_MAXIMUM give the real-world value the logical range
+        // stands for, and UNIT says in what. The Linux input layer turns that
+        // into input_absinfo::resolution, which SDL divides by -- so the scale
+        // reaches an application with no driver written for this board, and no
+        // protocol of ours involved.
+        //
+        // UNIT is 0xE011: SI Linear (nibble 0), length^1 (nibble 1),
+        // time^-2 (nibble 3) -- metres per second squared. UNIT_EXPONENT of -2
+        // puts the physical bounds in hundredths, so +/-8 g is +/-7845, which
+        // fits the 16-bit field that a value in whole m/s^2 would round away.
         USAGE_PAGE(1), 0x01,        // Generic desktop
-        USAGE(1), 0x30,             // X axis
-        USAGE(1), 0x31,             // Y axis
-        USAGE(1), 0x32,             // Z axis
-        USAGE(1), 0x33,             // RX axis ("X rotation")
-        USAGE(1), 0x34,             // RY axis
-        USAGE(1), 0x35,             // RZ axis
-        USAGE(1), 0x36,             // Slider
         LOGICAL_MINIMUM(2), 0x00,0xF0,   // each value ranges -4096
         LOGICAL_MAXIMUM(2), 0x00,0x10,   // ...to +4096
         REPORT_SIZE(1), 0x10,       // 16 bits per report
-        REPORT_COUNT(1), 0x07,      // 6 reports (X, Y, Z, RX, RY, RZ, Slider1)
+
+        // -- the two accelerometer axes, with their unit --
+        USAGE(1), 0x30,             // [ACCEL_A] first accelerometer axis
+        USAGE(1), 0x31,             // [ACCEL_B] second
+        PHYSICAL_MINIMUM(2), 0x00,0x00,  // [PHYS_LO] patched from the g setting
+        PHYSICAL_MAXIMUM(2), 0x00,0x00,  // [PHYS_HI]
+        UNIT(2), 0x11, 0xE0,        // SI Linear, m * s^-2
+        UNIT_EXPONENT(1), 0x0E,     // 10^-2 (4-bit signed: -2 is 0xE)
+        REPORT_COUNT(1), 0x02,
+        INPUT(1), 0x02,             // Data, Variable, Absolute
+
+        // -- the other five, which carry no physical quantity we can name --
+        PHYSICAL_MINIMUM(1), 0x00,  // 0/0 means "same as logical", i.e. none
+        PHYSICAL_MAXIMUM(1), 0x00,
+        UNIT(1), 0x00,
+        UNIT_EXPONENT(1), 0x00,
+        USAGE(1), 0x32,             // [OTHER] the five axes with no unit
+        USAGE(1), 0x33,
+        USAGE(1), 0x34,
+        USAGE(1), 0x35,
+        USAGE(1), 0x36,
+        REPORT_COUNT(1), 0x05,
         INPUT(1), 0x02,             // Data, Variable, Absolute
          
         // output report (host to device)
@@ -859,8 +893,89 @@ void USBJoystick::callback_request(const setup_packet_t *setup)
     USBHID::callback_request(setup);
 }
 
+// Fill in the parts of the joystick report descriptor that depend on the
+// configuration: which two axes carry the accelerometer, and what their
+// full-scale counts mean in m/s^2.
+//
+// The descriptor is built once, at the first request, for the same reason the
+// configuration descriptor is: neither the axis assignment nor the g setting is
+// known at compile time. Both come from flash, and both are fixed for as long as
+// the device stays enumerated -- changing the range from the Config Tool saves
+// to flash and reboots, so the host sees a fresh descriptor.
+void USBJoystick::patchAxisDescriptor()
+{
+    // Locate the two runs by the usage bytes the array was written with. Doing
+    // it by search rather than by offset means an edit above cannot silently
+    // move the target.
+    static const uint8_t accel_marker[] = { USAGE(1), 0x30, USAGE(1), 0x31 };
+    uint8_t *accel = nullptr, *other = nullptr, *phys = nullptr;
+    for (size_t i = 0; i + sizeof(accel_marker) <= sizeof(reportDescriptorJS); ++i)
+    {
+        if (memcmp(&reportDescriptorJS[i], accel_marker, sizeof(accel_marker)) == 0)
+        {
+            accel = &reportDescriptorJS[i];
+            break;
+        }
+    }
+    if (accel == nullptr)
+        return;
+    phys = accel + sizeof(accel_marker);      // PHYSICAL_MINIMUM follows
+
+    // The five remaining axes start after INPUT, whose position we find the
+    // same way: the second PHYSICAL_MINIMUM in the array.
+    for (uint8_t *p = phys + 1; p + 12 < reportDescriptorJS + sizeof(reportDescriptorJS); ++p)
+    {
+        if (p[0] == PHYSICAL_MINIMUM(1) && p[2] == PHYSICAL_MAXIMUM(1))
+        {
+            other = p + 8;                     // past the four zeroed items
+            break;
+        }
+    }
+
+    // Which pair carries the acceleration. Formats 0 and 2 put it on X/Y;
+    // format 1 moves it to Rx/Ry, leaving X/Y unused.
+    const uint8_t a = (axisFormat == AXIS_FORMAT_RXRYRZ) ? 0x33 : 0x30;
+    const uint8_t b = (axisFormat == AXIS_FORMAT_RXRYRZ) ? 0x34 : 0x31;
+    accel[1] = a;
+    accel[3] = b;
+    if (other != nullptr)
+    {
+        // Everything from X to Slider except the two above, in order.
+        uint8_t *o = other;
+        for (uint8_t u = 0x30; u <= 0x36; ++u)
+        {
+            if (u == a || u == b)
+                continue;
+            o[1] = u;
+            o += 2;
+        }
+    }
+
+    // Full scale in hundredths of m/s^2, matching UNIT_EXPONENT of -2.
+    // accelRangeG is the *reported* range, which is not the chip's in the 1 g
+    // mode: that runs the hardware at 2 g and halves the readings, so a host
+    // told the hardware figure would be wrong by a factor of two.
+    const int16_t hi = static_cast<int16_t>(accelRangeG * 980.665f);
+    const int16_t lo = static_cast<int16_t>(-hi);
+    // phys[0] is the PHYSICAL_MINIMUM item, [1..2] its little-endian data,
+    // [3] the PHYSICAL_MAXIMUM item, [4..5] its data.
+    phys[1] = static_cast<uint8_t>(lo & 0xff);
+    phys[2] = static_cast<uint8_t>((lo >> 8) & 0xff);
+    phys[4] = static_cast<uint8_t>(hi & 0xff);
+    phys[5] = static_cast<uint8_t>((hi >> 8) & 0xff);
+}
+
 const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len) 
 {    
+    // The joystick descriptor carries configuration-dependent values; fill them
+    // in the first time anyone asks for it.
+    static bool patched = false;
+    if (!patched)
+    {
+        patchAxisDescriptor();
+        patched = true;
+    }
+
     switch (idx)
     {
     case 0:
@@ -1272,8 +1387,7 @@ const uint8_t *USBJoystick::string_iconfiguration_desc()
 // button scan.
 bool USBJoystick::sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
                           int16_t ax, int16_t ay, int16_t vx, int16_t vy,
-                          int16_t plungerPos, int16_t plungerSpeed,
-                          uint8_t nudgeFullScaleG)
+                          int16_t plungerPos, int16_t plungerSpeed)
 {
     // Nothing to send to if the interface was not configured.
     if (!useKB)
@@ -1295,15 +1409,6 @@ bool USBJoystick::sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
     opdPutI16(p, vy);
     opdPutI16(p, plungerPos);
     opdPutI16(p, plungerSpeed);
-
-    // 1.1: what the acceleration axes mean, and which firmware is saying it.
-    // The scale is the *reported* full scale, not the accelerometer's hardware
-    // range -- the 1 g setting is the 2 g hardware mode rescaled in software,
-    // and it is the reported figure the host needs to make sense of the axes.
-    *p++ = nudgeFullScaleG;
-    *p++ = VERSION_MAJOR;
-    *p++ = VERSION_MINOR;
-    *p++ = VERSION_PATCH;
 
     return write_start(_opd_in, buf, sizeof(buf));
 }

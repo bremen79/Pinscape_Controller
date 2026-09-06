@@ -29,24 +29,18 @@
 #define OPD_OFS_PLUNGER_POS     24   // int16   plunger position
 #define OPD_OFS_PLUNGER_SPEED   26   // int16   plunger speed
 
-// Fields added in 1.1, appended at the end as the spec's extension rule
-// requires, so that a reader built against 1.0 simply ignores them.
-//
-// nudgeFullScale is what the two acceleration axes mean: full scale on those
-// int16 fields corresponds to this many g. Without it the values have no unit
-// at all, and the host has to ask the user -- which is what pinball software
-// does today, defaulting to 1 g and being wrong by a factor of 2, 4 or 8 on a
-// board configured otherwise.
-//
-// Proposed as mjrgh/PinscapePico#124.
-#define OPD_OFS_NUDGE_FULL_SCALE 28  // uint8   full scale in g, 0 = unknown
-#define OPD_OFS_FIRMWARE_VERSION 29  // uint8[3] major, minor, patch
-
 // Size of the report, and the string identifying it. A host matches the string
-// only up to the '/', treating what follows as Major.Minor, so a reader built
-// against 1.0 keeps working against this one.
-#define OPD_REPORT_SIZE         32
-#define OPD_STRUCT_STRDESC      "OpenPinballDeviceStruct/1.1"
+// only up to the '/', treating what follows as Major.Minor.
+//
+// The accelerometer's full scale and the firmware version deliberately do NOT
+// live here. Both already have a standard home: the scale belongs in the HID
+// descriptor's physical units on the joystick axes, and the version in the
+// device descriptor's bcdDevice, beside the manufacturer and product strings.
+// Putting them in the report would repeat a constant a thousand times a second
+// and make it unreadable until the first frame arrives -- the very frame that
+// needs it to be interpreted.
+#define OPD_REPORT_SIZE         28
+#define OPD_STRUCT_STRDESC      "OpenPinballDeviceStruct/1.0"
 
 // Pre-assigned pinball button indices, from the spec. The mask for a button is
 // (1 << index). Only the ones Pinscape can currently source are listed.

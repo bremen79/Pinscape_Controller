@@ -113,7 +113,8 @@ public:
      * @param axisFormat an AXIS_FORMAT_xxx value specifying the joystick axis report format
      * @param useKB enable the USB keyboard reporting interface
      */
-    USBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release, 
+    USBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release,
+        uint8_t accelRangeG, 
         int waitForConnect, bool enableJoystick, int axisFormat, bool useKB)
         // Mbed OS 6 reordered these: the first parameter of the simple
         // constructor is connect_blocking, not the report length, so the mbed 2
@@ -129,6 +130,7 @@ public:
     { 
         _init();
         this->useKB = useKB;
+        this->accelRangeG = accelRangeG;
         this->enableJoystick = enableJoystick;
         this->axisFormat = axisFormat;
         // Mbed OS 6 dropped the blocking flag; state is reported by callback.
@@ -235,15 +237,14 @@ public:
      *
      * @param genericButtons  32 general-purpose buttons, one bit each
      * @param pinballButtons  32 pre-assigned pinball buttons (OPD_BTN_xxx)
-     * @param ax,ay           nudge acceleration, full scale = nudgeFullScaleG()
+     * @param ax,ay           nudge acceleration
      * @param vx,vy           nudge velocity
      * @param plungerPos      plunger position, +32767 = fully retracted
      * @param plungerSpeed    plunger speed
      */
     bool sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
                  int16_t ax, int16_t ay, int16_t vx, int16_t vy,
-                 int16_t plungerPos, int16_t plungerSpeed,
-                 uint8_t nudgeFullScaleG);
+                 int16_t plungerPos, int16_t plungerSpeed);
 
     /** Is the Open Pinball Device interface present in this configuration? */
     bool opdEnabled() const { return useKB; }
@@ -400,6 +401,11 @@ public:
     virtual const uint8_t *configuration_desc(uint8_t index);
     virtual const uint8_t *reportDesc(int idx, uint16_t &len);
 
+    // Fill in the configuration-dependent parts of the joystick report
+    // descriptor: which axes carry the accelerometer, and what their counts
+    // mean in m/s^2. See the definition.
+    void patchAxisDescriptor();
+
     /* USB descriptor string overrides */
     virtual const uint8_t *string_imanufacturer_desc();
     virtual const uint8_t *string_iserial_desc();
@@ -482,6 +488,12 @@ private:
     
     // joystick axis reporting format
     int axisFormat;
+
+    // Accelerometer full scale in g, as *reported* on the axes -- not the
+    // chip's hardware range, which differs in the 1 g mode. Published in the
+    // report descriptor's physical units so that a host needs no driver of its
+    // own to make sense of the axis values.
+    uint8_t accelRangeG;
     
     // enable the keyboard interface for button inputs
     bool useKB;
