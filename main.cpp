@@ -4408,6 +4408,16 @@ public:
         // set the range
         int rangeInG = range_ == AccelRange4G ? 4 : range_ == AccelRange8G ? 8 : 2;
         mma_.setRange(rangeInG);
+
+        // The full scale the *reports* use, which is not always the chip's.
+        // AccelRange1G runs the hardware at 2 g and halves the reported values,
+        // so a host told "2" would be wrong by a factor of two. This is the
+        // figure that gives the axis values their meaning, so it is the one
+        // published on the Open Pinball Device interface.
+        reportedRangeInG_ =
+            range_ == AccelRange1G ? 1 :
+            range_ == AccelRange2G ? 2 :
+            range_ == AccelRange4G ? 4 : 8;
                 
         // set the average accumulators to zero
         xSum_ = ySum_ = 0;
@@ -4540,6 +4550,9 @@ public:
     // time of last *different* sample from FIFO
     uint32_t tLastChangedSample;
     
+    // Full scale of the reported acceleration axes, in g. See reset().
+    uint8_t reportedRangeInG() const { return reportedRangeInG_; }
+
     void get(int &x, int &y) 
     {
         // read the shared data and store locally for calculations
@@ -4718,6 +4731,10 @@ private:
     
     // range (AccelRangeXxx value, from config.h)
     uint8_t range_;
+
+    // Reported full scale in g, which is not the hardware range in the 1 g
+    // mode. Set in reset(), beside the chip configuration it derives from.
+    uint8_t reportedRangeInG_ = 1;
     
     // auto-center mode: 
     //   0 = default of 5-second auto-centering
@@ -7628,6 +7645,27 @@ int main(void)
             {
                 // send the joystick report
                 jsOK = js.update(x, y, zReported, z0Reported, vx, vy, zvReported, jsButtons, statusFlags);
+
+                // Open Pinball Device carries the same measurements on its own
+                // interface, in the layout its specification fixes, so software
+                // reading it needs to know nothing about this board. It is sent
+                // on the same cadence as the joystick report: the readings are
+                // the same ones, and halving the rate of either would show up
+                // as lag in the simulator's physics.
+                //
+                // The button fields stay empty for now. OPD assigns meanings to
+                // its pinball buttons -- Start, Coin, MagnaSave and the rest --
+                // and mapping Pinscape's configurable button table onto them is
+                // a separate piece of work from carrying the axes.
+                if (js.opdEnabled())
+                {
+                    js.sendOPD(0, 0,
+                               static_cast<int16_t>(x), static_cast<int16_t>(y),
+                               static_cast<int16_t>(vx), static_cast<int16_t>(vy),
+                               static_cast<int16_t>(zReported),
+                               static_cast<int16_t>(zvReported),
+                               accel.reportedRangeInG());
+                }
             }
             
             // we've just started a new report interval, so reset the timer

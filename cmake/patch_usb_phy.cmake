@@ -55,6 +55,22 @@ function(pinscape_patch_usb_phy)
                        driver "${driver}")
         message(STATUS "USB: added the missing <stddef.h>/<string.h> to the Kinetis driver")
     endif()
+    # -- the driver: let endpoint 3 carry interrupt transfers ---------------
+    #
+    # The table gives EP1 and EP2 to bulk/interrupt and reserves EP3 to
+    # isochronous, so a device needing a third interrupt IN endpoint has
+    # nowhere to put it. The hardware has no such restriction; the table is
+    # how Mbed chose to divide it. Adding the bulk/interrupt attribute rather
+    # than replacing the isochronous one leaves EP3 usable for its original
+    # purpose as well.
+    if(driver MATCHES "\\{USB_EP_ATTR_ALLOW_ISO \\| USB_EP_ATTR_DIR_IN_AND_OUT")
+        string(REPLACE
+            "{USB_EP_ATTR_ALLOW_ISO | USB_EP_ATTR_DIR_IN_AND_OUT"
+            "{USB_EP_ATTR_ALLOW_ISO | ALLOW_BULK_OR_INT_ENDPOINTS | USB_EP_ATTR_DIR_IN_AND_OUT"
+            driver "${driver}")
+        message(STATUS "USB: endpoint 3 opened to interrupt transfers")
+    endif()
+
     file(WRITE "${out}/USBPhy_Kinetis.cpp" "${driver}")
 
     # -- build the copy instead of the original -----------------------------

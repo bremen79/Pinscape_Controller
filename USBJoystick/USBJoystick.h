@@ -224,6 +224,29 @@ public:
      * @param chB channel "B" reading
      */
     bool sendPlungerStatusQuadrature(int chA, int chB);
+
+    /**
+     * Send an Open Pinball Device report.
+     *
+     * OPD is a vendor-neutral interface for pinball cabinet controls: nudge,
+     * plunger and buttons, in a layout fixed by its specification rather than
+     * by us. Pinball software reading it needs to know nothing about this
+     * board -- the spec deliberately refuses even VID/PID matching.
+     *
+     * @param genericButtons  32 general-purpose buttons, one bit each
+     * @param pinballButtons  32 pre-assigned pinball buttons (OPD_BTN_xxx)
+     * @param ax,ay           nudge acceleration, full scale = nudgeFullScaleG()
+     * @param vx,vy           nudge velocity
+     * @param plungerPos      plunger position, +32767 = fully retracted
+     * @param plungerSpeed    plunger speed
+     */
+    bool sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
+                 int16_t ax, int16_t ay, int16_t vx, int16_t vy,
+                 int16_t plungerPos, int16_t plungerSpeed,
+                 uint8_t nudgeFullScaleG);
+
+    /** Is the Open Pinball Device interface present in this configuration? */
+    bool opdEnabled() const { return useKB; }
     
     /**
      * Send a VCNL4010 sensor extra status report
@@ -382,6 +405,14 @@ public:
     virtual const uint8_t *string_iserial_desc();
     virtual const uint8_t *string_iproduct_desc();
 
+    // The Open Pinball Device report descriptor labels its data block with a
+    // string index, and the host identifies the structure -- and its version --
+    // by that string rather than by VID/PID. Mbed only dispatches the six
+    // standard string indices, and Pinscape leaves the configuration string
+    // unused, so the label lives there. (Proposed upstream as
+    // mbed-ce/mbed-os#622, which would allow an index of our own.)
+    virtual const uint8_t *string_iconfiguration_desc();
+
     /* Serve the right report descriptor for each interface.
      *
      * USBHID::callback_request answers REPORT_DESCRIPTOR from report_desc(),
@@ -438,6 +469,7 @@ public:
     // after endpoint numbers; they are registered per endpoint now.
     void _kb_send_isr();
     void _kb_read_isr();
+    void _opd_send_isr();
 
      
 private:
@@ -464,6 +496,12 @@ private:
     // joystick buttons.
     usb_ep_t _kb_in = 0;
     usb_ep_t _kb_out = 0;
+
+    // Endpoint for the Open Pinball Device interface. IN only: the host never
+    // sends anything on it. Bundled with the keyboard rather than separately
+    // switchable, so a cabinet with LedWiz compatibility trouble strips down to
+    // the joystick interface alone in one step.
+    usb_ep_t _opd_in = 0;
 
     // Reception buffer for the keyboard endpoint. read_start() needs somewhere
     // to put a packet before the callback runs.

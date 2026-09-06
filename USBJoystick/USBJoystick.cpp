@@ -17,6 +17,8 @@
 * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
  
+#include "OpenPinballDevice.h"
+#include "Version.h"
 #include "stdint.h"
 #include "USBJoystick.h"
 #include "EndpointResolver.h"
@@ -639,6 +641,11 @@ void USBJoystick::_init() {
    resolver.endpoint_out(USB_EP_TYPE_INT, MAX_HID_REPORT_SIZE);
    _kb_in = resolver.endpoint_in(USB_EP_TYPE_INT, MAX_REPORT_KB_TX + 1);
    _kb_out = resolver.endpoint_out(USB_EP_TYPE_INT, MAX_REPORT_KB_RX + 1);
+
+   // Open Pinball Device: one more IN endpoint, nothing coming back. This is
+   // the third interrupt endpoint on a controller Mbed's table hands out two
+   // of, which is why the port opens EP3 -- see cmake/patch_usb_phy.cmake.
+   _opd_in = resolver.endpoint_in(USB_EP_TYPE_INT, OPD_REPORT_SIZE + 1);
    MBED_ASSERT(resolver.valid());
 
    _x = 0;                       
@@ -775,6 +782,33 @@ static const uint8_t reportDescriptorKB[] =
 // USB HID Report Descriptor - LedWiz only, with no joystick or keyboard
 // input reporting
 //
+// Open Pinball Device report descriptor.
+//
+// The whole report is one opaque byte block: the host identifies its layout
+// from the string descriptor attached to it, not from HID usages. That is the
+// specification's own design -- the USB-IF pinball usages exist but are not
+// well enough defined for the job, so OPD labels a vendor-specific block
+// instead. See OpenPinballDevice.h.
+// Report ID for the OPD interface. Unique within that interface, which is
+// all the HID spec requires; the other interfaces use unnumbered reports.
+#define OPD_REPORT_ID  0x01
+
+static const uint8_t reportDescriptorOPD[] = 
+{
+    0x05, 0x05,                     // USAGE_PAGE (Game Controls)
+    0x09, 0x02,                     // USAGE (Pinball Device)
+    0xA1, 0x01,                     // COLLECTION (Application)
+    0x85, OPD_REPORT_ID,            //   REPORT_ID
+    0x79, STRING_OFFSET_ICONFIGURATION, //   STRING INDEX (the struct label)
+    0x09, 0x00,                     //   USAGE (undefined - opaque data)
+    0x15, 0x00,                     //   LOGICAL_MINIMUM (0)
+    0x26, 0xFF, 0x00,               //   LOGICAL_MAXIMUM (255)
+    0x75, 0x08,                     //   REPORT_SIZE (8 bits)
+    0x95, OPD_REPORT_SIZE,          //   REPORT_COUNT (the struct size)
+    0x81, 0x00,                     //   INPUT (Data, Array, Absolute)
+    0xC0                            // END_COLLECTION
+};
+
 static const uint8_t reportDescriptorLW[] = 
 {         
     USAGE_PAGE(1), 0x01,            // Generic desktop
@@ -849,6 +883,19 @@ const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
         {
             len = sizeof(reportDescriptorKB);
             return reportDescriptorKB;
+        }
+        else
+        {
+            len = 0;
+            return 0;
+        }
+
+    case 2:
+        // Open Pinball Device, which travels with the keyboard.
+        if (useKB)
+        {
+            len = sizeof(reportDescriptorOPD);
+            return reportDescriptorOPD;
         }
         else
         {
@@ -956,18 +1003,22 @@ const uint8_t *USBJoystick::configuration_desc(uint8_t index)
     reportDesc(1, rptlen1);
     if (useKB)
     {
+        // Three interfaces now: joystick/LedWiz, keyboard, and Open Pinball
+        // Device. OPD needs only an IN endpoint, so five in total.
+        uint16_t rptlen2 = 0;
+        reportDesc(2, rptlen2);
         const int cfglenKB = 
             ((1 * CONFIGURATION_DESCRIPTOR_LENGTH)
-             + (2 * INTERFACE_DESCRIPTOR_LENGTH)
-             + (2 * HID_DESCRIPTOR_LENGTH)
-             + (4 * ENDPOINT_DESCRIPTOR_LENGTH));
+             + (3 * INTERFACE_DESCRIPTOR_LENGTH)
+             + (3 * HID_DESCRIPTOR_LENGTH)
+             + (5 * ENDPOINT_DESCRIPTOR_LENGTH));
         static uint8_t configurationDescriptorWithKB[] = 
         {
             CONFIGURATION_DESCRIPTOR_LENGTH,// bLength
             CONFIGURATION_DESCRIPTOR,       // bDescriptorType
             LSB(cfglenKB),                  // wTotalLength (LSB)
             MSB(cfglenKB),                  // wTotalLength (MSB)
-            0x02,                           // bNumInterfaces - TWO INTERFACES (JOYSTICK + KEYBOARD)
+            0x03,                           // bNumInterfaces - JOYSTICK + KEYBOARD + OPEN PINBALL DEVICE
             DEFAULT_CONFIGURATION,          // bConfigurationValue
             0x00,                           // iConfiguration
             C_RESERVED | C_SELF_POWERED,    // bmAttributes
@@ -1047,9 +1098,49 @@ const uint8_t *USBJoystick::configuration_desc(uint8_t index)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
             1,                              // bInterval (milliseconds)
 
+            // ***** INTERFACE 2 - OPEN PINBALL DEVICE *****
+            //
+            // One IN endpoint and no OUT: the host only ever reads. Polled at
+            // 1 ms like the others, since nudge is what the simulator's
+            // physics runs on and stale readings show up as lag.
+            INTERFACE_DESCRIPTOR_LENGTH,    // bLength
+            INTERFACE_DESCRIPTOR,           // bDescriptorType
+            0x02,                           // bInterfaceNumber
+            0x00,                           // bAlternateSetting
+            0x01,                           // bNumEndpoints
+            HID_CLASS,                      // bInterfaceClass
+            HID_SUBCLASS_NONE,              // bInterfaceSubClass
+            HID_PROTOCOL_NONE,              // bInterfaceProtocol
+            0x00,                           // iInterface
+
+            HID_DESCRIPTOR_LENGTH,          // bLength
+            HID_DESCRIPTOR,                 // bDescriptorType
+            LSB(HID_VERSION_1_11),          // bcdHID (LSB)
+            MSB(HID_VERSION_1_11),          // bcdHID (MSB)
+            0x00,                           // bCountryCode
+            0x01,                           // bNumDescriptors
+            REPORT_DESCRIPTOR,              // bDescriptorType
+            LSB(rptlen2),                   // wDescriptorLength (LSB)
+            MSB(rptlen2),                   // wDescriptorLength (MSB)
+
+            ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
+            ENDPOINT_DESCRIPTOR,            // bDescriptorType
+            _opd_in,                        // bEndpointAddress
+            E_INTERRUPT,                    // bmAttributes
+            LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
+            MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
+            1,                              // bInterval (milliseconds)
+
         };
 
-        // Keyboard + joystick interfaces
+        // wTotalLength is written from cfglenKB, so the two have to agree: a
+        // descriptor that declares the wrong length is rejected by the host
+        // with nothing to say why. Cheap to assert, and it catches exactly the
+        // mistake an added interface invites.
+        static_assert(sizeof(configurationDescriptorWithKB) == cfglenKB,
+                      "configuration descriptor length does not match wTotalLength");
+
+        // Joystick + keyboard + Open Pinball Device
         return configurationDescriptorWithKB;
     }
     else
@@ -1109,6 +1200,9 @@ const uint8_t *USBJoystick::configuration_desc(uint8_t index)
             1                               // bInterval (milliseconds)
         };
 
+        static_assert(sizeof(configurationDescriptorNoKB) == cfglenNoKB,
+                      "configuration descriptor length does not match wTotalLength");
+
         return configurationDescriptorNoKB;
     }
 }
@@ -1134,7 +1228,90 @@ void USBJoystick::callback_set_configuration(uint8_t configuration)
         endpoint_add(_kb_out, MAX_REPORT_KB_RX + 1, USB_EP_TYPE_INT,
                      &USBJoystick::_kb_read_isr);
         read_start(_kb_out, _kb_out_buf, MAX_REPORT_KB_RX + 1);
+
+        // Open Pinball Device travels with the keyboard. IN only, so there is
+        // nothing to arm for reception.
+        endpoint_add(_opd_in, OPD_REPORT_SIZE + 1, USB_EP_TYPE_INT,
+                     &USBJoystick::_opd_send_isr);
     }
+}
+
+// The Open Pinball Device struct label.
+//
+// OPD identifies its report layout, and its version, by this string rather
+// than by VID/PID -- the specification says so explicitly, since the whole
+// point is that any vendor can implement it. A host matches only up to the
+// '/' and reads what follows as Major.Minor, so a later revision can append
+// fields without breaking readers built against this one.
+//
+// It sits at the configuration string index because Mbed dispatches only the
+// six standard indices and Pinscape uses none for the configuration. Once
+// mbed-ce/mbed-os#622 lands this can move to an index of its own.
+const uint8_t *USBJoystick::string_iconfiguration_desc()
+{
+    static const char label[] = OPD_STRUCT_STRDESC;
+    static const size_t nChars = sizeof(label) - 1;
+
+    // USB string descriptors are UTF-16LE, with a two-byte header. The label
+    // is ASCII, so the high byte of each character is zero.
+    static uint8_t desc[2 + nChars*2];
+    desc[0] = sizeof(desc);
+    desc[1] = STRING_DESCRIPTOR;
+    for (size_t i = 0; i < nChars; ++i)
+    {
+        desc[2 + i*2] = static_cast<uint8_t>(label[i]);
+        desc[3 + i*2] = 0;
+    }
+    return desc;
+}
+
+// Send one Open Pinball Device report.
+//
+// Fire and forget, like the keyboard reports: a dropped nudge sample is of no
+// consequence next to blocking the main loop, which runs the plunger and the
+// button scan.
+bool USBJoystick::sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
+                          int16_t ax, int16_t ay, int16_t vx, int16_t vy,
+                          int16_t plungerPos, int16_t plungerSpeed,
+                          uint8_t nudgeFullScaleG)
+{
+    // Nothing to send to if the interface was not configured.
+    if (!useKB)
+        return false;
+
+    // The report ID prefixes the struct on the wire.
+    uint8_t buf[1 + OPD_REPORT_SIZE];
+    uint8_t *p = buf;
+    *p++ = OPD_REPORT_ID;
+
+    // The timestamp is microseconds from an arbitrary origin; the host uses it
+    // to order and interpolate samples, never as a wall clock.
+    opdPutU64(p, static_cast<uint64_t>(us_ticker_read()));
+    opdPutU32(p, genericButtons);
+    opdPutU32(p, pinballButtons);
+    opdPutI16(p, ax);
+    opdPutI16(p, ay);
+    opdPutI16(p, vx);
+    opdPutI16(p, vy);
+    opdPutI16(p, plungerPos);
+    opdPutI16(p, plungerSpeed);
+
+    // 1.1: what the acceleration axes mean, and which firmware is saying it.
+    // The scale is the *reported* full scale, not the accelerometer's hardware
+    // range -- the 1 g setting is the 2 g hardware mode rescaled in software,
+    // and it is the reported figure the host needs to make sense of the axes.
+    *p++ = nudgeFullScaleG;
+    *p++ = VERSION_MAJOR;
+    *p++ = VERSION_MINOR;
+    *p++ = VERSION_PATCH;
+
+    return write_start(_opd_in, buf, sizeof(buf));
+}
+
+// Completion of an Open Pinball Device IN transfer.
+void USBJoystick::_opd_send_isr()
+{
+    write_finish(_opd_in);
 }
 
 // Completion of a keyboard IN transfer. Nothing to do but let the endpoint go:
