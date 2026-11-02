@@ -50,10 +50,10 @@ void HaltOutOfMem()
 // mbed heap layout, we know everything above this point should be free,
 // at least until we reach the lowest address used by the stack.
 //
-// The ultimate size of the stack is of course dynamic and unpredictable.
-// In testing, it appears that we currently need a little over 1K.  To be
-// conservative, we'll reserve 2K for the stack, by taking it out of the
-// space at top of memory we consider fair game for malloc.
+// The stack reservation comes from target.boot-stack-size in mbed_app.json5.
+// The old 2 KB allowance is too small for Mbed CE: main alone uses nearly
+// that much, before nested calls and interrupts. Use the linker heap limit
+// so the allocator cannot hand out any of the reserved stack area.
 //
 // Note that we could do this a little more low-level-ly if we wanted.
 // The ARM linker provides a pre-defined extern char[] variable named 
@@ -76,6 +76,7 @@ extern "C" {
     // the library one. See the link options in CMakeLists.txt.
     void *__wrap_malloc(size_t);
     void *__real_malloc(size_t);
+    extern char __HeapLimit;
     void __wrap_free(void *);
 };
 
@@ -99,15 +100,19 @@ void *xmalloc(size_t siz)
         // the free pool starts
         xmalloc_nxt = (char *)__real_malloc(4);
         
-        // figure the amount of space we can use - we have from the base
-        // of the pool to the top of RAM, minus an allowance for the stack
-        const uint32_t TopOfRAM = 0x20003000UL;
-        const uint32_t StackSize = 2*1024;
-        xmalloc_rem = TopOfRAM - StackSize - uint32_t(xmalloc_nxt);
+        // The linker and allocator must reserve the same stack area.
+        // Mbed CE needs more stack than the old fixed 2 KB allowance.
+        const uintptr_t limit = reinterpret_cast<uintptr_t>(&__HeapLimit);
+        const uintptr_t start = reinterpret_cast<uintptr_t>(xmalloc_nxt);
+        if (xmalloc_nxt == 0 || start >= limit)
+            HaltOutOfMem();
+        xmalloc_rem = limit - start;
     }
     
-    // align to a dword boundary
-    siz = (siz + 3) & ~3;
+    // align to a dword boundary without wrapping a large request
+    if (siz > SIZE_MAX - 3)
+        HaltOutOfMem();
+    siz = (siz + 3) & ~size_t(3);
     
     // make sure we have enough space left for this chunk
     if (siz > xmalloc_rem)

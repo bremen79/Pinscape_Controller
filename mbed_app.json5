@@ -6,19 +6,22 @@
             // overflowed the reserved region by 2312 bytes.
             "target.application-profile": "bare-metal",
 
-            // Keep the console.
-            //
-            // Mbed OS retargets stdout onto a UART, which costs 1264 bytes of
-            // flash and a 1 KB stdio buffer -- mbed 2 linked no serial support
-            // unless asked. It is kept here anyway: on the KL25Z that UART
-            // reaches the host through the OpenSDA chip, and it is the only way
-            // to see anything at all on a board with no debugger. Every USB
-            // fault in this port was found down that wire.
-            //
-            // It pairs with TEST_KEEP_PRINTF in config.h, which frees PTA1/PTA2
-            // for the UART. Without both, output would drive pins wired to
-            // something else.
-            "target.console-uart": true,
+            // The Mbed CE USB object makes main's stack frame about 2 KB.
+            // Leave another 1 KB for calls and interrupt handlers. Use the
+            // small C library to recover RAM for the sensor/input heap.
+            "target.boot-stack-size": "0xC00",
+            "target.c_lib": "small",
+
+            // Endpoint 3 carries HID reports, so 64-byte packets suffice.
+            // Avoid the default pair of 1023-byte buffers and recover 1918
+            // bytes of RAM. Newer Mbed headers use this setting instead of
+            // the literal definition handled by our legacy USB patch.
+            "target.kinetis-max-packet-size-ep3": 64,
+
+            // Release firmware never initializes the OpenSDA UART, including
+            // on fatal errors. CMake enables it only for an explicitly selected
+            // diagnostic build; it also checks for saved PTA1/PTA2 assignments.
+            "target.console-uart": false,
 
             // printf without floating point or 64-bit integers.
             //

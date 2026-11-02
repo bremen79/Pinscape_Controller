@@ -190,7 +190,11 @@ void SimpleDMA::irq_handler(void)
 {
     DMAMUX0->CHCFG[_channel] = 0;
     DMA0->DMA[_channel].DSR_BCR |= DMA_DSR_BCR_DONE_MASK;
-    _callback.call();
+    // Completion callbacks are optional. The TSL14xx clock-up and ADC
+    // channels only need the hardware cleanup above; only clock-down
+    // has a handler. Mbed Callback cannot be called when empty.
+    if (_callback)
+        _callback.call();
 }
 
 void SimpleDMA::irq_handler0( void ) 

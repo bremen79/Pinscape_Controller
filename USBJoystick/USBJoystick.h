@@ -114,7 +114,6 @@ public:
      * @param useKB enable the USB keyboard reporting interface
      */
     USBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release,
-        uint8_t accelRangeG, 
         int waitForConnect, bool enableJoystick, int axisFormat, bool useKB)
         // Mbed OS 6 reordered these: the first parameter of the simple
         // constructor is connect_blocking, not the report length, so the mbed 2
@@ -130,7 +129,6 @@ public:
     { 
         _init();
         this->useKB = useKB;
-        this->accelRangeG = accelRangeG;
         this->enableJoystick = enableJoystick;
         this->axisFormat = axisFormat;
         // Mbed OS 6 dropped the blocking flag; state is reported by callback.
@@ -162,6 +160,10 @@ public:
      * currently pressed.  See the HID report descriptor for the order of bits.
      */
     bool mediaUpdate(uint8_t data);
+
+    // HID idle periods repeat the current state; this is not an event queue.
+    bool kbIdleExpired() const;
+    bool mediaIdleExpired() const;
      
     /**
      * Update the joystick status
@@ -391,6 +393,10 @@ public:
      */
     bool buttons(uint32_t buttons);
 
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    void reportNudgeDiagnostics() const;
+#endif
+
     /* USB descriptor overrides
      *
      * Mbed OS 6 renamed every one of these, so the mbed 2 spellings below
@@ -400,11 +406,6 @@ public:
      */
     virtual const uint8_t *configuration_desc(uint8_t index);
     virtual const uint8_t *reportDesc(int idx, uint16_t &len);
-
-    // Fill in the configuration-dependent parts of the joystick report
-    // descriptor: which axes carry the accelerometer, and what their counts
-    // mean in m/s^2. See the definition.
-    void patchAxisDescriptor();
 
     /* USB descriptor string overrides */
     virtual const uint8_t *string_imanufacturer_desc();
@@ -419,53 +420,28 @@ public:
     // mbed-ce/mbed-os#622, which would allow an index of our own.)
     virtual const uint8_t *string_iconfiguration_desc();
 
-    /* Serve the right report descriptor for each interface.
-     *
-     * USBHID::callback_request answers REPORT_DESCRIPTOR from report_desc(),
-     * which takes no interface: it assumes a device has exactly one HID
-     * interface. This one has two -- joystick/LedWiz and keyboard -- so the
-     * request is routed here by wIndex before falling back to the base class.
-     */
-    virtual void callback_request(const setup_packet_t *setup);
-     
-    /* set/get idle time */
-    virtual void setIdleTime(int ifc, int rptid, int t)
-    {
-        // Remember the new value if operating on the keyboard.  Remember
-        // separate keyboard and media control idle times, in case the
-        // host wants separate report rates.
-        if (ifc == IFC_ID_KB)
-        {
-            if (rptid == REPORT_ID_KB)
-                kbIdleTime = t;
-            else if (rptid == REPORT_ID_MEDIA)
-                mediaIdleTime = t;
-        }
-    }
-    virtual uint8_t getIdleTime(int ifc, int rptid)
-    {
-        // Return the kb idle time if the kb interface is the one requested.
-        if (ifc == IFC_ID_KB)
-        {
-            if (rptid == REPORT_ID_KB)
-               return kbIdleTime;
-            if (rptid == REPORT_ID_MEDIA)
-               return mediaIdleTime;
-        }
-        
-        // we don't use idle times for other interfaces or report types
-        return 0;
-    }
-     
+    // Handle all HID interfaces here: Mbed's base handler assumes one interface.
+    void callback_request(const setup_packet_t *setup) override;
+    void callback_request_xfer_done(const setup_packet_t *setup, bool aborted) override;
+
     /* callback overrides */
 
     // Endpoints are added here. The base class handles the joystick/LedWiz
     // pair; the keyboard pair is ours, since USBHID manages only one.
     virtual void callback_set_configuration(uint8_t configuration) override;
 
-    // Both interfaces are ours, and neither has alternate settings.
-    virtual void callback_set_interface(uint16_t interface, uint8_t alternate) override
-        { (void)interface; (void)alternate; }
+    // Every advertised interface has only alternate setting zero.
+    void callback_set_interface(uint16_t interface, uint8_t alternate) override;
+    void callback_state_change(DeviceState state) override;
+
+    // A completed IN packet means the host is reading again after a timeout.
+    void report_tx() override
+    {
+        _replyTimedOut = false;
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+        ++_diagCompletedReports;
+#endif
+    }
 
     // A report arrived on the joystick/LedWiz endpoint. Was EP1_OUT_callback,
     // which had to do its own reading; the base class reads it now.
@@ -479,6 +455,9 @@ public:
 
      
 private:
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    volatile uint32_t _diagCompletedReports = 0;
+#endif
 
     // Incoming LedWiz message buffer.  Each LedWiz message is exactly 8 bytes.
     CircBuf<LedWizMsg, 16> lwbuf;
@@ -489,17 +468,21 @@ private:
     // joystick axis reporting format
     int axisFormat;
 
-    // Accelerometer full scale in g, as *reported* on the axes -- not the
-    // chip's hardware range, which differs in the 1 g mode. Published in the
-    // report descriptor's physical units so that a host needs no driver of its
-    // own to make sense of the axis values.
-    uint8_t accelRangeG;
-    
     // enable the keyboard interface for button inputs
     bool useKB;
     
     // keyboard maximum idle time between reports
-    uint8_t kbIdleTime;
+    volatile uint8_t kbIdleTime = 0;
+    volatile uint8_t _kbProtocol = 1; // report protocol; zero is boot protocol
+    volatile bool _kbResend = false;
+    uint32_t _kbLastSend = 0;
+    uint32_t _mediaLastSend = 0;
+
+    // EP0 needs its own persistent buffer, separate from interrupt OUT reads.
+    uint8_t _controlBuf[HID_DESCRIPTOR_LENGTH] = { 0 };
+    bool _controlOutput = false;
+    volatile bool _replyTimedOut = false;
+    bool sendReply(const HID_REPORT *report);
 
     // Endpoints for the keyboard interface. USBHID provides one pair of its
     // own for the joystick; the keyboard is a second interface on this same
@@ -520,7 +503,7 @@ private:
     uint8_t _kb_out_buf[MAX_REPORT_KB_RX + 1] = { 0 };
     
     // media maximum idle time between reports
-    uint8_t mediaIdleTime;
+    volatile uint8_t mediaIdleTime = 0;
     
     // current X, Y, Z axis values
     int16_t _x;                       

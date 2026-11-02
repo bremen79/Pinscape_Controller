@@ -49,14 +49,17 @@
 class MMA8451Q
 {
 public:
+  // Boolean operations return false on I2C failure or timeout.
+  // Multi-axis reads leave the output arguments unchanged on failure.
   /**
   * MMA8451Q constructor
   *
   * @param sda SDA pin
   * @param sdl SCL pin
   * @param addr addr of the I2C peripheral
+  * @param initialize false to defer sensor setup until init()
   */
-  MMA8451Q(PinName sda, PinName scl, int addr);
+  MMA8451Q(PinName sda, PinName scl, int addr, bool initialize = true);
 
   /**
   * MMA8451Q destructor
@@ -66,17 +69,17 @@ public:
   /**
   *  Reset the accelerometer hardware and set our initial parameters
   */
-  void init();
+  bool init();
 
   /**
    * Enter standby mode
    */
-  void standby();
+  bool standby();
   
   /**
    * Enter active mode
    */
-  void active();
+  bool active();
   
   /**
    * Get the value of the WHO_AM_I register
@@ -102,14 +105,14 @@ public:
   /**
    *  Read an X,Y pair
    */
-  void getAccXY(float &x, float &y);
+  bool getAccXY(float &x, float &y);
   
   /**
    *  Read X,Y,Z as floats.  This is the second most efficient way 
    *  to fetch all three axes (after the integer version), since it
    *  fetches all axes in a single I2C transaction.
    */
-  void getAccXYZ(float &x, float &y, float &z);
+  bool getAccXYZ(float &x, float &y, float &z);
   
   /**
    *  Read X,Y,Z as integers.  This reads the three axes in a single
@@ -118,7 +121,7 @@ public:
    *  Each axis value is represented an an integer using the device's 
    *  native 14-bit scale, so each is in the range -8192..+8191.
    */
-  void getAccXYZ(int &x, int &y, int &z);
+  bool getAccXYZ(int &x, int &y, int &z);
 
   /**
    * Get Z axis acceleration
@@ -139,17 +142,17 @@ public:
    * The caller is responsible for setting up an interrupt handler on the corresponding
    * PTAxx pin.
    */
-  void setInterruptMode(int pin);
+  bool setInterruptMode(int pin);
   
   /**
    * Set the hardware dynamic range, in G.  Valid ranges are 2, 4, and 8.
    */
-  void setRange(int g);
+  bool setRange(int g);
   
   /**
    * Disable interrupts.
    */
-  void clearInterruptMode();
+  bool clearInterruptMode();
   
   /**
    * Is a sample ready?
@@ -159,13 +162,14 @@ public:
   /**
    * Get the number of FIFO samples available
    */
-  int getFIFOCount();
+  int getFIFOCount();  // -1 on I2C error or invalid FIFO count
 
 private:
+  bool waitForClear(int addr, uint8_t mask);
   I2C m_i2c;
   int m_addr;
-  void readRegs(int addr, uint8_t * data, int len);
-  void writeRegs(uint8_t * data, int len);
+  bool readRegs(int addr, uint8_t * data, int len);
+  bool writeRegs(uint8_t * data, int len);
   int16_t getAccAxis(uint8_t addr);
   
   // Translate a 14-bit register value to a signed integer.  The

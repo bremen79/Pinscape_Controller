@@ -32,13 +32,8 @@
 // Size of the report, and the string identifying it. A host matches the string
 // only up to the '/', treating what follows as Major.Minor.
 //
-// The accelerometer's full scale and the firmware version deliberately do NOT
-// live here. Both already have a standard home: the scale belongs in the HID
-// descriptor's physical units on the joystick axes, and the version in the
-// device descriptor's bcdDevice, beside the manufacturer and product strings.
-// Putting them in the report would repeat a constant a thousand times a second
-// and make it unreadable until the first frame arrives -- the very frame that
-// needs it to be interpreted.
+// The firmware version is reported separately in the device descriptor's
+// bcdDevice field. Keep this payload compatible with the OPD 1.0 structure.
 #define OPD_REPORT_SIZE         28
 #define OPD_STRUCT_STRDESC      "OpenPinballDeviceStruct/1.0"
 

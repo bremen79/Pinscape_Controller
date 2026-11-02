@@ -29,7 +29,22 @@ if(NOT MBED_TOOLCHAIN)
     set(MBED_TOOLCHAIN GCC_ARM CACHE STRING "Mbed toolchain")
 endif()
 
-set(MBED_APP_JSON_PATH mbed_app.json5)
+# Configure the console before Mbed resolves its library settings. Release
+# builds must not initialize the UART on pins a saved cabinet config can use.
+option(PINSCAPE_CRASH_DIAGNOSTICS "Print fatal error details on the OpenSDA serial port" OFF)
+option(PINSCAPE_NUDGE_DIAGNOSTICS "Log sensor data and completed USB transfers once per second" OFF)
+if(PINSCAPE_NUDGE_DIAGNOSTICS AND NOT PINSCAPE_CRASH_DIAGNOSTICS)
+    message(FATAL_ERROR "Nudge diagnostics require PINSCAPE_CRASH_DIAGNOSTICS=ON for the guarded UART")
+endif()
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/mbed_app.json5" pinscape_app_config)
+if(PINSCAPE_CRASH_DIAGNOSTICS)
+    string(REPLACE "\"target.console-uart\": false" "\"target.console-uart\": true"
+        pinscape_app_config "${pinscape_app_config}")
+endif()
+set(MBED_APP_JSON_PATH "${CMAKE_CURRENT_BINARY_DIR}/pinscape_mbed_app.json5")
+file(CONFIGURE OUTPUT "${MBED_APP_JSON_PATH}" CONTENT "${pinscape_app_config}" @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/mbed_app.json5")
 
 # The stock KL25Z target does not enable USB device support; see the comment in
 # custom_targets.json5. Build against a derived target that does.
@@ -41,6 +56,11 @@ project(Pinscape_Controller
         LANGUAGES C CXX ASM)
 
 include(mbed_project_setup)
+
+# Keep compiler stack reports alongside the objects, including LTO output.
+# Static RAM totals alone cannot detect a stack/heap collision.
+add_compile_options(-fstack-usage)
+add_link_options(-fstack-usage)
 
 add_subdirectory(custom_targets)
 add_subdirectory(mbed-os)
@@ -145,6 +165,17 @@ target_link_options(${PROJECT_NAME} PRIVATE -Wl,--wrap=malloc -Wl,--wrap=free)
 # Link-time optimisation, on trial.
 target_compile_options(${PROJECT_NAME} PRIVATE -flto)
 target_link_options(${PROJECT_NAME} PRIVATE -flto)
+
+# Release builds suppress Mbed's normal error printout. Keep a separate,
+# size-optimized diagnostic image available for failures reported by LED only.
+if(PINSCAPE_CRASH_DIAGNOSTICS)
+    target_sources(${PROJECT_NAME} PRIVATE CrashDiagnostics.cpp)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PINSCAPE_CRASH_DIAGNOSTICS=1)
+endif()
+
+if(PINSCAPE_NUDGE_DIAGNOSTICS)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PINSCAPE_NUDGE_DIAGNOSTICS=1)
+endif()
 
 mbed_set_post_build(${PROJECT_NAME})
 

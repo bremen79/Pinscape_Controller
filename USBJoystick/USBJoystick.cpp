@@ -22,6 +22,7 @@
 #include "stdint.h"
 #include "USBJoystick.h"
 #include "EndpointResolver.h"
+#include "hal/us_ticker_api.h"
 
 #include "config.h"  // Pinscape configuration
 
@@ -110,35 +111,85 @@ bool USBJoystick::update()
    report.length = reportLen;
  
    // send the report
-   return send(&report);
+   return send_nb(&report);
+}
+
+// Configuration responses can contain several packets. Preserve their ordering,
+// but restore the old 100 ms limit instead of USBHID::send's infinite wait.
+// Once a timeout occurs, fail subsequent packets promptly until traffic resumes.
+bool USBJoystick::sendReply(const HID_REPORT *report)
+{
+    const uint32_t start = us_ticker_read();
+    do
+    {
+        if (send_nb(report))
+        {
+            _replyTimedOut = false;
+            return true;
+        }
+        if (!configured() || _replyTimedOut)
+            return false;
+        wait_us(50);
+    } while (uint32_t(us_ticker_read() - start) < 100000);
+
+    _replyTimedOut = true;
+    return false;
 }
 
 bool USBJoystick::kbUpdate(uint8_t data[8])
 {
-    // set up the report
-    HID_REPORT report;
-    report.data[0] = REPORT_ID_KB;      // report ID = keyboard
-    memcpy(&report.data[1], data, 8);   // copy the kb report data
-    report.length = 9;                  // length = ID prefix + kb report length
-    
-    // send it to endpoint 4 (the keyboard interface endpoint)
-    write_start(_kb_in, report.data, report.length);
+    CriticalSectionLock lock;
+    uint8_t report[9];
+    report[0] = REPORT_ID_KB;
+    memcpy(report + 1, data, 8);
+    const bool boot = (_kbProtocol == 0);
+    if (!useKB || !write_start(_kb_in, report + (boot ? 1 : 0), boot ? 8 : 9))
+        return false;
+    _kbLastSend = us_ticker_read();
+    _kbResend = false;
     return true;
 }
 
 bool USBJoystick::mediaUpdate(uint8_t data)
 {
-    // set up the report
-    HID_REPORT report;
-    report.data[0] = REPORT_ID_MEDIA;   // report ID = media
-    report.data[1] = data;              // key pressed bits
-    report.length = 2;
-    
-    // send it
-    write_start(_kb_in, report.data, report.length);
+    CriticalSectionLock lock;
+    if (!useKB || !configured())
+        return false;
+    // Boot keyboards have no consumer-control report.
+    if (_kbProtocol == 0)
+        return true;
+    uint8_t report[] = { REPORT_ID_MEDIA, data };
+    if (!write_start(_kb_in, report, sizeof(report)))
+        return false;
+    _mediaLastSend = us_ticker_read();
     return true;
 }
- 
+
+bool USBJoystick::kbIdleExpired() const
+{
+    if (!useKB)
+        return false;
+    if (_kbResend)
+        return true;
+    const uint32_t now = us_ticker_read();
+    const uint32_t kbAge = uint32_t(now - _kbLastSend);
+    const uint32_t mediaAge = uint32_t(now - _mediaLastSend);
+    const uint8_t idle = kbIdleTime, mediaIdle = mediaIdleTime;
+    const bool mediaDue = _kbProtocol != 0 && mediaIdle != 0
+        && mediaAge >= uint32_t(mediaIdle)*4000;
+    // Both reports share a pipe. If both idle periods have expired, send
+    // the older one first so a slow host cannot starve media reports.
+    return idle != 0 && kbAge >= uint32_t(idle)*4000
+        && (!mediaDue || kbAge >= mediaAge);
+}
+
+bool USBJoystick::mediaIdleExpired() const
+{
+    const uint8_t idle = mediaIdleTime;
+    return useKB && _kbProtocol != 0 && idle != 0
+        && uint32_t(us_ticker_read() - _mediaLastSend) >= uint32_t(idle)*4000;
+}
+
 bool USBJoystick::sendPlungerStatus(int npix, int plungerPos, int flags, 
     uint32_t avgScanTime, uint32_t processingTime, int16_t speed)
 {
@@ -189,7 +240,7 @@ bool USBJoystick::sendPlungerStatus(int npix, int plungerPos, int flags,
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatus2(
@@ -240,7 +291,7 @@ bool USBJoystick::sendPlungerStatus2(
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatusBarcode(
@@ -278,7 +329,7 @@ bool USBJoystick::sendPlungerStatusBarcode(
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatusQuadrature(int chA, int chB)
@@ -300,7 +351,7 @@ bool USBJoystick::sendPlungerStatusQuadrature(int chA, int chB)
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatusVCNL4010(int filteredProxCount, int rawProxCount)
@@ -322,7 +373,7 @@ bool USBJoystick::sendPlungerStatusVCNL4010(int filteredProxCount, int rawProxCo
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 
@@ -345,7 +396,7 @@ bool USBJoystick::sendPlungerPix(int &idx, int npix, const uint8_t *pix)
         report.data[ofs] = (idx < npix ? pix[idx++] : 0);
     
     // send the report
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportID(int index)
@@ -384,7 +435,7 @@ bool USBJoystick::reportID(int index)
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportBuildInfo(const char *date)
@@ -428,7 +479,7 @@ bool USBJoystick::reportBuildInfo(const char *date)
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportConfigVar(const uint8_t *data)
@@ -448,7 +499,7 @@ bool USBJoystick::reportConfigVar(const uint8_t *data)
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportConfig(
@@ -501,7 +552,7 @@ bool USBJoystick::reportConfig(
 
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 // report physical button status
@@ -525,7 +576,7 @@ bool USBJoystick::reportButtonStatus(int numButtons, const uint8_t *state)
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 // report raw IR timing codes (for learning mode)
@@ -552,7 +603,7 @@ bool USBJoystick::reportRawIR(int n, const uint16_t *data)
     
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportRawBytes(const uint8_t *data, size_t len)
@@ -560,7 +611,7 @@ bool USBJoystick::reportRawBytes(const uint8_t *data, size_t len)
     HID_REPORT report;
     report.length = reportLen;
     memcpy(report.data, data, len < reportLen ? len : reportLen);
-    return send(&report);
+    return send_nb(&report);
 }
 
 // report a decoded IR command
@@ -584,7 +635,7 @@ bool USBJoystick::reportIRCode(uint8_t pro, uint8_t flags, uint64_t code)
         
     // send the report
     report.length = reportLen;
-    return send(&report);
+    return sendReply(&report);
 }
 
 bool USBJoystick::move(int16_t x, int16_t y) 
@@ -617,7 +668,7 @@ bool USBJoystick::updateStatus(uint32_t status)
    report.length = reportLen;
  
    // send the report
-   return send(&report);
+   return send_nb(&report);
 }
 
 void USBJoystick::_init() {
@@ -651,6 +702,7 @@ void USBJoystick::_init() {
    _x = 0;                       
    _y = 0;     
    _z = 0;
+   _z0 = 0;
    _vx = 0;
    _vy = 0;
    _vz = 0;
@@ -664,8 +716,8 @@ void USBJoystick::_init() {
 //
 // USB HID Report Descriptor - Joystick
 //
-static uint8_t reportDescriptorJS[] = 
-{         
+static const uint8_t reportDescriptorJS[] =
+{
     USAGE_PAGE(1), 0x01,            // Generic desktop
     USAGE(1), 0x04,                 // Joystick
     COLLECTION(1), 0x01,            // Application
@@ -690,54 +742,20 @@ static uint8_t reportDescriptorJS[] =
         UNIT(1), 0x00,              // Unit (None)                                           
         INPUT(1), 0x02,             // Data, Variable, Absolute
        
-        // The axes, in two runs so that the two carrying the accelerometer can
-        // declare what their counts mean.
-        //
-        // A host otherwise has no way to know: -4096..+4096 is a range, not a
-        // unit, and the same board reports +/-1 g or 2, 4 or 8 depending on how
-        // its owner configured it. Pinball software works around that by asking
-        // the user, and gets it wrong by a factor of two, four or eight when the
-        // user does not know either.
-        //
-        // HID has said how to express this since the beginning: PHYSICAL_MINIMUM
-        // and PHYSICAL_MAXIMUM give the real-world value the logical range
-        // stands for, and UNIT says in what. The Linux input layer turns that
-        // into input_absinfo::resolution, which SDL divides by -- so the scale
-        // reaches an application with no driver written for this board, and no
-        // protocol of ours involved.
-        //
-        // UNIT is 0xE011: SI Linear (nibble 0), length^1 (nibble 1),
-        // time^-2 (nibble 3) -- metres per second squared. UNIT_EXPONENT of -2
-        // puts the physical bounds in hundredths, so +/-8 g is +/-7845, which
-        // fits the 16-bit field that a value in whole m/s^2 would round away.
         USAGE_PAGE(1), 0x01,        // Generic desktop
+        USAGE(1), 0x30,             // X axis
+        USAGE(1), 0x31,             // Y axis
+        USAGE(1), 0x32,             // Z axis
+        USAGE(1), 0x33,             // RX axis ("X rotation")
+        USAGE(1), 0x34,             // RY axis
+        USAGE(1), 0x35,             // RZ axis
+        USAGE(1), 0x36,             // Slider
         LOGICAL_MINIMUM(2), 0x00,0xF0,   // each value ranges -4096
         LOGICAL_MAXIMUM(2), 0x00,0x10,   // ...to +4096
         REPORT_SIZE(1), 0x10,       // 16 bits per report
-
-        // -- the two accelerometer axes, with their unit --
-        USAGE(1), 0x30,             // [ACCEL_A] first accelerometer axis
-        USAGE(1), 0x31,             // [ACCEL_B] second
-        PHYSICAL_MINIMUM(2), 0x00,0x00,  // [PHYS_LO] patched from the g setting
-        PHYSICAL_MAXIMUM(2), 0x00,0x00,  // [PHYS_HI]
-        UNIT(2), 0x11, 0xE0,        // SI Linear, m * s^-2
-        UNIT_EXPONENT(1), 0x0E,     // 10^-2 (4-bit signed: -2 is 0xE)
-        REPORT_COUNT(1), 0x02,
+        REPORT_COUNT(1), 0x07,      // 7 reports (X, Y, Z, RX, RY, RZ, Slider1)
         INPUT(1), 0x02,             // Data, Variable, Absolute
 
-        // -- the other five, which carry no physical quantity we can name --
-        PHYSICAL_MINIMUM(1), 0x00,  // 0/0 means "same as logical", i.e. none
-        PHYSICAL_MAXIMUM(1), 0x00,
-        UNIT(1), 0x00,
-        UNIT_EXPONENT(1), 0x00,
-        USAGE(1), 0x32,             // [OTHER] the five axes with no unit
-        USAGE(1), 0x33,
-        USAGE(1), 0x34,
-        USAGE(1), 0x35,
-        USAGE(1), 0x36,
-        REPORT_COUNT(1), 0x05,
-        INPUT(1), 0x02,             // Data, Variable, Absolute
-         
         // output report (host to device)
         REPORT_SIZE(1), 0x08,       // 8 bits per report
         REPORT_COUNT(1), 0x08,      // output report count - 8-byte LedWiz format
@@ -869,113 +887,158 @@ static const uint8_t reportDescriptorLW[] =
 };
 
 
-// Answer GET_DESCRIPTOR(REPORT) for whichever interface asked.
-//
-// The base class serves report_desc(), which knows nothing about interfaces.
-// With the keyboard enabled this device has two, and the host asks for each
-// one by number in wIndex; sending the joystick descriptor for both would
-// leave the keyboard interface describing keys it does not have.
+// The base USBHID class handles only one interface and its SET_REPORT path
+// uses the wrong transfer direction. Keep our composite HID control traffic
+// here, including a separate EP0 buffer so interrupt OUT cannot overwrite it.
 void USBJoystick::callback_request(const setup_packet_t *setup)
 {
-    if (setup->bmRequestType.Type == STANDARD_TYPE
-        && setup->bRequest == GET_DESCRIPTOR
-        && DESCRIPTOR_TYPE(setup->wValue) == REPORT_DESCRIPTOR)
+    _controlOutput = false;
+    const bool iface = setup->bmRequestType.Recipient == INTERFACE_RECIPIENT;
+    const bool validInterface = setup->wIndex < (useKB ? 3 : 1);
+    const bool input = setup->bmRequestType.dataTransferDirection == DEVICE_TO_HOST;
+    const uint8_t id = setup->wValue & 0xff;
+
+    if (setup->bmRequestType.Type == STANDARD_TYPE && iface
+        && setup->bRequest == GET_DESCRIPTOR)
     {
         uint16_t len = 0;
-        const uint8_t *desc = reportDesc(setup->wIndex, len);
-        if (desc != NULL && len != 0)
+        const uint8_t *desc = validInterface ? reportDesc(setup->wIndex, len) : NULL;
+        if (!input || id != 0 || desc == NULL)
         {
-            complete_request(Send, (uint8_t *)desc, len);
+            complete_request(Failure, NULL, 0);
             return;
         }
-    }
-
-    USBHID::callback_request(setup);
-}
-
-// Fill in the parts of the joystick report descriptor that depend on the
-// configuration: which two axes carry the accelerometer, and what their
-// full-scale counts mean in m/s^2.
-//
-// The descriptor is built once, at the first request, for the same reason the
-// configuration descriptor is: neither the axis assignment nor the g setting is
-// known at compile time. Both come from flash, and both are fixed for as long as
-// the device stays enumerated -- changing the range from the Config Tool saves
-// to flash and reboots, so the host sees a fresh descriptor.
-void USBJoystick::patchAxisDescriptor()
-{
-    // Locate the two runs by the usage bytes the array was written with. Doing
-    // it by search rather than by offset means an edit above cannot silently
-    // move the target.
-    static const uint8_t accel_marker[] = { USAGE(1), 0x30, USAGE(1), 0x31 };
-    uint8_t *accel = nullptr, *other = nullptr, *phys = nullptr;
-    for (size_t i = 0; i + sizeof(accel_marker) <= sizeof(reportDescriptorJS); ++i)
-    {
-        if (memcmp(&reportDescriptorJS[i], accel_marker, sizeof(accel_marker)) == 0)
+        if (DESCRIPTOR_TYPE(setup->wValue) == REPORT_DESCRIPTOR)
         {
-            accel = &reportDescriptorJS[i];
-            break;
+            complete_request(Send, const_cast<uint8_t *>(desc), len);
+            return;
         }
-    }
-    if (accel == nullptr)
+        if (DESCRIPTOR_TYPE(setup->wValue) == HID_DESCRIPTOR)
+        {
+            const uint8_t hid[] = { HID_DESCRIPTOR_LENGTH, HID_DESCRIPTOR,
+                LSB(HID_VERSION_1_11), MSB(HID_VERSION_1_11), 0, 1,
+                REPORT_DESCRIPTOR, uint8_t(LSB(len)), uint8_t(MSB(len)) };
+            memcpy(_controlBuf, hid, sizeof(hid));
+            complete_request(Send, _controlBuf, sizeof(hid));
+            return;
+        }
+        complete_request(Failure, NULL, 0);
         return;
-    phys = accel + sizeof(accel_marker);      // PHYSICAL_MINIMUM follows
+    }
 
-    // The five remaining axes start after INPUT, whose position we find the
-    // same way: the second PHYSICAL_MINIMUM in the array.
-    for (uint8_t *p = phys + 1; p + 12 < reportDescriptorJS + sizeof(reportDescriptorJS); ++p)
+    if (setup->bmRequestType.Type == CLASS_TYPE)
     {
-        if (p[0] == PHYSICAL_MINIMUM(1) && p[2] == PHYSICAL_MAXIMUM(1))
+        if (!iface || !validInterface || !configured())
         {
-            other = p + 8;                     // past the four zeroed items
+            complete_request(Failure, NULL, 0);
+            return;
+        }
+        const bool keyboard = setup->wIndex == IFC_ID_KB;
+        switch (setup->bRequest)
+        {
+        case SET_REPORT:
+            // Only output reports exist: unnumbered LedWiz (8 bytes), or
+            // keyboard LEDs (ID + one byte in report protocol, one in boot).
+            if (!input && (setup->wValue >> 8) == 2
+                && ((setup->wIndex == IFC_ID_JS && id == 0 && setup->wLength == 8)
+                    || (keyboard && ((_kbProtocol == 1 && id == REPORT_ID_KB && setup->wLength == 2)
+                        || (_kbProtocol == 0 && id == 0 && setup->wLength == 1)))))
+            {
+                _controlOutput = true;
+                complete_request(Receive, _controlBuf, setup->wLength);
+                return;
+            }
+            break;
+
+        case SET_IDLE:
+            if (!input && keyboard && setup->wLength == 0
+                && (id == 0 || id == REPORT_ID_KB || id == REPORT_ID_MEDIA))
+            {
+                const uint8_t idle = setup->wValue >> 8;
+                if (id == 0 || id == REPORT_ID_KB) kbIdleTime = idle;
+                if (id == 0 || id == REPORT_ID_MEDIA) mediaIdleTime = idle;
+                complete_request(Success, NULL, 0);
+                return;
+            }
+            break;
+
+        case GET_IDLE:
+            if (input && keyboard && (setup->wValue >> 8) == 0 && setup->wLength == 1
+                && (id == REPORT_ID_KB || id == REPORT_ID_MEDIA || (_kbProtocol == 0 && id == 0)))
+            {
+                _controlBuf[0] = id == REPORT_ID_MEDIA ? mediaIdleTime : kbIdleTime;
+                complete_request(Send, _controlBuf, 1);
+                return;
+            }
+            break;
+
+        case 0x0B: // SET_PROTOCOL (boot keyboard)
+            if (!input && keyboard && setup->wLength == 0 && setup->wValue <= 1)
+            {
+                _kbProtocol = setup->wValue;
+                _kbResend = true;
+                complete_request(Success, NULL, 0);
+                return;
+            }
+            break;
+
+        case 0x03: // GET_PROTOCOL
+            if (input && keyboard && setup->wLength == 1 && setup->wValue == 0)
+            {
+                _controlBuf[0] = _kbProtocol;
+                complete_request(Send, _controlBuf, 1);
+                return;
+            }
             break;
         }
+        complete_request(Failure, NULL, 0);
+        return;
     }
 
-    // Which pair carries the acceleration. Formats 0 and 2 put it on X/Y;
-    // format 1 moves it to Rx/Ry, leaving X/Y unused.
-    const uint8_t a = (axisFormat == AXIS_FORMAT_RXRYRZ) ? 0x33 : 0x30;
-    const uint8_t b = (axisFormat == AXIS_FORMAT_RXRYRZ) ? 0x34 : 0x31;
-    accel[1] = a;
-    accel[3] = b;
-    if (other != nullptr)
-    {
-        // Everything from X to Slider except the two above, in order.
-        uint8_t *o = other;
-        for (uint8_t u = 0x30; u <= 0x36; ++u)
-        {
-            if (u == a || u == b)
-                continue;
-            o[1] = u;
-            o += 2;
-        }
-    }
-
-    // Full scale in hundredths of m/s^2, matching UNIT_EXPONENT of -2.
-    // accelRangeG is the *reported* range, which is not the chip's in the 1 g
-    // mode: that runs the hardware at 2 g and halves the readings, so a host
-    // told the hardware figure would be wrong by a factor of two.
-    const int16_t hi = static_cast<int16_t>(accelRangeG * 980.665f);
-    const int16_t lo = static_cast<int16_t>(-hi);
-    // phys[0] is the PHYSICAL_MINIMUM item, [1..2] its little-endian data,
-    // [3] the PHYSICAL_MAXIMUM item, [4..5] its data.
-    phys[1] = static_cast<uint8_t>(lo & 0xff);
-    phys[2] = static_cast<uint8_t>((lo >> 8) & 0xff);
-    phys[4] = static_cast<uint8_t>(hi & 0xff);
-    phys[5] = static_cast<uint8_t>((hi >> 8) & 0xff);
+    // USBDevice owns standard enumeration/configuration requests.
+    complete_request(PassThrough, NULL, 0);
 }
 
-const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len) 
-{    
-    // The joystick descriptor carries configuration-dependent values; fill them
-    // in the first time anyone asks for it.
-    static bool patched = false;
-    if (!patched)
+void USBJoystick::callback_request_xfer_done(const setup_packet_t *setup, bool aborted)
+{
+    bool ok = !aborted;
+    if (_controlOutput && !aborted)
     {
-        patchAxisDescriptor();
-        patched = true;
+        if (setup->wIndex == IFC_ID_JS)
+        {
+            LedWizMsg msg;
+            memcpy(msg.data, _controlBuf, sizeof(msg.data));
+            ok = lwbuf.write(msg);
+        }
+        else if (_kbProtocol != 0)
+        {
+            // Numbered reports carry their ID in the data as well as wValue.
+            ok = _controlBuf[0] == REPORT_ID_KB;
+        }
     }
+    _controlOutput = false;
+    complete_request_xfer_done(ok);
+}
 
+void USBJoystick::callback_set_interface(uint16_t interface, uint8_t alternate)
+{
+    complete_set_interface(configured() && interface < (useKB ? 3 : 1) && alternate == 0);
+}
+
+void USBJoystick::callback_state_change(DeviceState state)
+{
+    USBHID::callback_state_change(state);
+    if (state != Configured)
+    {
+        kbIdleTime = mediaIdleTime = 0;
+        _kbProtocol = 1;
+        _kbResend = false;
+        _replyTimedOut = false;
+    }
+}
+
+const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
+{
     switch (idx)
     {
     case 0:
@@ -1328,10 +1391,12 @@ void USBJoystick::callback_set_configuration(uint8_t configuration)
 {
     // The base class owns the joystick/LedWiz pair: it adds both endpoints and
     // arms reception on the OUT one. Doing it here as well would add them twice.
-    USBHID::callback_set_configuration(configuration);
-
     if (configuration != DEFAULT_CONFIGURATION)
+    {
+        complete_set_configuration(false);
         return;
+    }
+    USBHID::callback_set_configuration(configuration);
 
     // The keyboard interface is a second pair on top, when any button is set up
     // as a key. mbed 2 named these endpoints; they are allocated now, so the
@@ -1400,7 +1465,9 @@ bool USBJoystick::sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
 
     // The timestamp is microseconds from an arbitrary origin; the host uses it
     // to order and interpolate samples, never as a wall clock.
-    opdPutU64(p, static_cast<uint64_t>(us_ticker_read()));
+    // Mbed extends the hardware counter across wraparound, including intervals
+    // when OPD reporting is paused. A cast of us_ticker_read() cannot do that.
+    opdPutU64(p, ticker_read_us(get_us_ticker_data()));
     opdPutU32(p, genericButtons);
     opdPutU32(p, pinballButtons);
     opdPutI16(p, ax);
@@ -1470,3 +1537,14 @@ void USBJoystick::report_rx()
 }
 
 
+
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+// Bench diagnostics only. Never print from the USB interrupt callback.
+void USBJoystick::reportNudgeDiagnostics() const
+{
+    printf("Nudge USB: enabled=%u format=%u completed=%lu axes=%d,%d,%d,%d,%d,%d,%d\r\n",
+        unsigned(enableJoystick), unsigned(axisFormat),
+        static_cast<unsigned long>(_diagCompletedReports),
+        int(_x), int(_y), int(_z), int(_vx), int(_vy), int(_vz), int(_z0));
+}
+#endif
