@@ -71,7 +71,7 @@ using namespace IRRemote;
 struct DebugItem { char c; int t; DebugItem(char c, int t) : c(c),t(t) {} 
     DebugItem(char c) : c(c), t(0) { } DebugItem() : c(0), t(0) { }
 };
-extern CircBuf<DebugItem,256> debug;
+extern CircBuf<DebugItem,256> irDebugLog;
 
 
 // IR transmitter state object.

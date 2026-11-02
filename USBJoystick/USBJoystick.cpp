@@ -17,18 +17,25 @@
 * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
  
+#include "OpenPinballDevice.h"
+#include "Version.h"
 #include "stdint.h"
 #include "USBJoystick.h"
+#include "EndpointResolver.h"
+#include "hal/us_ticker_api.h"
 
 #include "config.h"  // Pinscape configuration
 
 
 
-// Maximum report sizes
 const int MAX_REPORT_JS_TX = USBJoystick::reportLen;
-const int MAX_REPORT_JS_RX = 8;
-const int MAX_REPORT_KB_TX = 8;
-const int MAX_REPORT_KB_RX = 4;
+
+// The interrupt endpoints are full speed, so 64 bytes is their ceiling.
+// mbed 2 spelled this MAX_PACKET_SIZE_EPINT.
+const int MAX_PACKET_SIZE_EPINT = 64;
+
+// The remaining report sizes now live in the header: the class declares receive
+// buffers of these sizes, so they have to be visible where it is defined.
 
 bool USBJoystick::update(int16_t x, int16_t y, int16_t z, int16_t z0, int16_t vx, int16_t vy, int16_t vz, uint32_t buttons, uint16_t status) 
 {
@@ -104,33 +111,85 @@ bool USBJoystick::update()
    report.length = reportLen;
  
    // send the report
-   return sendTO(&report, 100);
+   return send_nb(&report);
+}
+
+// Configuration responses can contain several packets. Preserve their ordering,
+// but restore the old 100 ms limit instead of USBHID::send's infinite wait.
+// Once a timeout occurs, fail subsequent packets promptly until traffic resumes.
+bool USBJoystick::sendReply(const HID_REPORT *report)
+{
+    const uint32_t start = us_ticker_read();
+    do
+    {
+        if (send_nb(report))
+        {
+            _replyTimedOut = false;
+            return true;
+        }
+        if (!configured() || _replyTimedOut)
+            return false;
+        wait_us(50);
+    } while (uint32_t(us_ticker_read() - start) < 100000);
+
+    _replyTimedOut = true;
+    return false;
 }
 
 bool USBJoystick::kbUpdate(uint8_t data[8])
 {
-    // set up the report
-    HID_REPORT report;
-    report.data[0] = REPORT_ID_KB;      // report ID = keyboard
-    memcpy(&report.data[1], data, 8);   // copy the kb report data
-    report.length = 9;                  // length = ID prefix + kb report length
-    
-    // send it to endpoint 4 (the keyboard interface endpoint)
-    return writeTO(EP4IN, report.data, report.length, MAX_PACKET_SIZE_EPINT, 100);
+    CriticalSectionLock lock;
+    uint8_t report[9];
+    report[0] = REPORT_ID_KB;
+    memcpy(report + 1, data, 8);
+    const bool boot = (_kbProtocol == 0);
+    if (!useKB || !write_start(_kb_in, report + (boot ? 1 : 0), boot ? 8 : 9))
+        return false;
+    _kbLastSend = us_ticker_read();
+    _kbResend = false;
+    return true;
 }
 
 bool USBJoystick::mediaUpdate(uint8_t data)
 {
-    // set up the report
-    HID_REPORT report;
-    report.data[0] = REPORT_ID_MEDIA;   // report ID = media
-    report.data[1] = data;              // key pressed bits
-    report.length = 2;
-    
-    // send it
-    return writeTO(EP4IN, report.data, report.length, MAX_PACKET_SIZE_EPINT, 100);
+    CriticalSectionLock lock;
+    if (!useKB || !configured())
+        return false;
+    // Boot keyboards have no consumer-control report.
+    if (_kbProtocol == 0)
+        return true;
+    uint8_t report[] = { REPORT_ID_MEDIA, data };
+    if (!write_start(_kb_in, report, sizeof(report)))
+        return false;
+    _mediaLastSend = us_ticker_read();
+    return true;
 }
- 
+
+bool USBJoystick::kbIdleExpired() const
+{
+    if (!useKB)
+        return false;
+    if (_kbResend)
+        return true;
+    const uint32_t now = us_ticker_read();
+    const uint32_t kbAge = uint32_t(now - _kbLastSend);
+    const uint32_t mediaAge = uint32_t(now - _mediaLastSend);
+    const uint8_t idle = kbIdleTime, mediaIdle = mediaIdleTime;
+    const bool mediaDue = _kbProtocol != 0 && mediaIdle != 0
+        && mediaAge >= uint32_t(mediaIdle)*4000;
+    // Both reports share a pipe. If both idle periods have expired, send
+    // the older one first so a slow host cannot starve media reports.
+    return idle != 0 && kbAge >= uint32_t(idle)*4000
+        && (!mediaDue || kbAge >= mediaAge);
+}
+
+bool USBJoystick::mediaIdleExpired() const
+{
+    const uint8_t idle = mediaIdleTime;
+    return useKB && _kbProtocol != 0 && idle != 0
+        && uint32_t(us_ticker_read() - _mediaLastSend) >= uint32_t(idle)*4000;
+}
+
 bool USBJoystick::sendPlungerStatus(int npix, int plungerPos, int flags, 
     uint32_t avgScanTime, uint32_t processingTime, int16_t speed)
 {
@@ -181,7 +240,7 @@ bool USBJoystick::sendPlungerStatus(int npix, int plungerPos, int flags,
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatus2(
@@ -232,7 +291,7 @@ bool USBJoystick::sendPlungerStatus2(
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatusBarcode(
@@ -270,7 +329,7 @@ bool USBJoystick::sendPlungerStatusBarcode(
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatusQuadrature(int chA, int chB)
@@ -292,7 +351,7 @@ bool USBJoystick::sendPlungerStatusQuadrature(int chA, int chB)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::sendPlungerStatusVCNL4010(int filteredProxCount, int rawProxCount)
@@ -314,7 +373,7 @@ bool USBJoystick::sendPlungerStatusVCNL4010(int filteredProxCount, int rawProxCo
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 
@@ -337,7 +396,7 @@ bool USBJoystick::sendPlungerPix(int &idx, int npix, const uint8_t *pix)
         report.data[ofs] = (idx < npix ? pix[idx++] : 0);
     
     // send the report
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportID(int index)
@@ -376,7 +435,7 @@ bool USBJoystick::reportID(int index)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportBuildInfo(const char *date)
@@ -420,7 +479,7 @@ bool USBJoystick::reportBuildInfo(const char *date)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportConfigVar(const uint8_t *data)
@@ -440,7 +499,7 @@ bool USBJoystick::reportConfigVar(const uint8_t *data)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportConfig(
@@ -493,7 +552,7 @@ bool USBJoystick::reportConfig(
 
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 // report physical button status
@@ -517,7 +576,7 @@ bool USBJoystick::reportButtonStatus(int numButtons, const uint8_t *state)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 // report raw IR timing codes (for learning mode)
@@ -544,7 +603,7 @@ bool USBJoystick::reportRawIR(int n, const uint16_t *data)
     
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::reportRawBytes(const uint8_t *data, size_t len)
@@ -552,7 +611,7 @@ bool USBJoystick::reportRawBytes(const uint8_t *data, size_t len)
     HID_REPORT report;
     report.length = reportLen;
     memcpy(report.data, data, len < reportLen ? len : reportLen);
-    return sendTO(&report, 100);
+    return send_nb(&report);
 }
 
 // report a decoded IR command
@@ -576,7 +635,7 @@ bool USBJoystick::reportIRCode(uint8_t pro, uint8_t flags, uint64_t code)
         
     // send the report
     report.length = reportLen;
-    return sendTO(&report, 100);
+    return sendReply(&report);
 }
 
 bool USBJoystick::move(int16_t x, int16_t y) 
@@ -609,14 +668,41 @@ bool USBJoystick::updateStatus(uint32_t status)
    report.length = reportLen;
  
    // send the report
-   return sendTO(&report, 100);
+   return send_nb(&report);
 }
 
 void USBJoystick::_init() {
- 
+
+   // Resolve the keyboard endpoints now, not at SET_CONFIGURATION.
+   //
+   // The host reads the configuration descriptor first, and that descriptor
+   // has to name the endpoint addresses. _kb_in and _kb_out were still 0 at
+   // that point, so the keyboard interface advertised endpoint 0 and Linux
+   // rejected it: "couldn't find an input interrupt endpoint". Nothing warned
+   // about it, because endpoint_add() takes an address rather than handing
+   // one out -- under mbed 2 the numbers were fixed constants (EP1, EP4) and
+   // there was nothing to resolve.
+   //
+   // Replay the base class's allocation exactly -- control, then the joystick
+   // pair -- so those keep the addresses USBHID gave them, then take a pair
+   // for the keyboard.
+   EndpointResolver resolver(endpoint_table());
+   resolver.endpoint_ctrl(64);
+   resolver.endpoint_in(USB_EP_TYPE_INT, MAX_HID_REPORT_SIZE);
+   resolver.endpoint_out(USB_EP_TYPE_INT, MAX_HID_REPORT_SIZE);
+   _kb_in = resolver.endpoint_in(USB_EP_TYPE_INT, MAX_REPORT_KB_TX + 1);
+   _kb_out = resolver.endpoint_out(USB_EP_TYPE_INT, MAX_REPORT_KB_RX + 1);
+
+   // Open Pinball Device: one more IN endpoint, nothing coming back. This is
+   // the third interrupt endpoint on a controller Mbed's table hands out two
+   // of, which is why the port opens EP3 -- see cmake/patch_usb_phy.cmake.
+   _opd_in = resolver.endpoint_in(USB_EP_TYPE_INT, OPD_REPORT_SIZE + 1);
+   MBED_ASSERT(resolver.valid());
+
    _x = 0;                       
    _y = 0;     
    _z = 0;
+   _z0 = 0;
    _vx = 0;
    _vy = 0;
    _vz = 0;
@@ -630,8 +716,8 @@ void USBJoystick::_init() {
 //
 // USB HID Report Descriptor - Joystick
 //
-static const uint8_t reportDescriptorJS[] = 
-{         
+static const uint8_t reportDescriptorJS[] =
+{
     USAGE_PAGE(1), 0x01,            // Generic desktop
     USAGE(1), 0x04,                 // Joystick
     COLLECTION(1), 0x01,            // Application
@@ -667,9 +753,9 @@ static const uint8_t reportDescriptorJS[] =
         LOGICAL_MINIMUM(2), 0x00,0xF0,   // each value ranges -4096
         LOGICAL_MAXIMUM(2), 0x00,0x10,   // ...to +4096
         REPORT_SIZE(1), 0x10,       // 16 bits per report
-        REPORT_COUNT(1), 0x07,      // 6 reports (X, Y, Z, RX, RY, RZ, Slider1)
+        REPORT_COUNT(1), 0x07,      // 7 reports (X, Y, Z, RX, RY, RZ, Slider1)
         INPUT(1), 0x02,             // Data, Variable, Absolute
-         
+
         // output report (host to device)
         REPORT_SIZE(1), 0x08,       // 8 bits per report
         REPORT_COUNT(1), 0x08,      // output report count - 8-byte LedWiz format
@@ -748,6 +834,33 @@ static const uint8_t reportDescriptorKB[] =
 // USB HID Report Descriptor - LedWiz only, with no joystick or keyboard
 // input reporting
 //
+// Open Pinball Device report descriptor.
+//
+// The whole report is one opaque byte block: the host identifies its layout
+// from the string descriptor attached to it, not from HID usages. That is the
+// specification's own design -- the USB-IF pinball usages exist but are not
+// well enough defined for the job, so OPD labels a vendor-specific block
+// instead. See OpenPinballDevice.h.
+// Report ID for the OPD interface. Unique within that interface, which is
+// all the HID spec requires; the other interfaces use unnumbered reports.
+#define OPD_REPORT_ID  0x01
+
+static const uint8_t reportDescriptorOPD[] = 
+{
+    0x05, 0x05,                     // USAGE_PAGE (Game Controls)
+    0x09, 0x02,                     // USAGE (Pinball Device)
+    0xA1, 0x01,                     // COLLECTION (Application)
+    0x85, OPD_REPORT_ID,            //   REPORT_ID
+    0x79, STRING_OFFSET_ICONFIGURATION, //   STRING INDEX (the struct label)
+    0x09, 0x00,                     //   USAGE (undefined - opaque data)
+    0x15, 0x00,                     //   LOGICAL_MINIMUM (0)
+    0x26, 0xFF, 0x00,               //   LOGICAL_MAXIMUM (255)
+    0x75, 0x08,                     //   REPORT_SIZE (8 bits)
+    0x95, OPD_REPORT_SIZE,          //   REPORT_COUNT (the struct size)
+    0x81, 0x00,                     //   INPUT (Data, Array, Absolute)
+    0xC0                            // END_COLLECTION
+};
+
 static const uint8_t reportDescriptorLW[] = 
 {         
     USAGE_PAGE(1), 0x01,            // Generic desktop
@@ -774,8 +887,158 @@ static const uint8_t reportDescriptorLW[] =
 };
 
 
-const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len) 
-{    
+// The base USBHID class handles only one interface and its SET_REPORT path
+// uses the wrong transfer direction. Keep our composite HID control traffic
+// here, including a separate EP0 buffer so interrupt OUT cannot overwrite it.
+void USBJoystick::callback_request(const setup_packet_t *setup)
+{
+    _controlOutput = false;
+    const bool iface = setup->bmRequestType.Recipient == INTERFACE_RECIPIENT;
+    const bool validInterface = setup->wIndex < (useKB ? 3 : 1);
+    const bool input = setup->bmRequestType.dataTransferDirection == DEVICE_TO_HOST;
+    const uint8_t id = setup->wValue & 0xff;
+
+    if (setup->bmRequestType.Type == STANDARD_TYPE && iface
+        && setup->bRequest == GET_DESCRIPTOR)
+    {
+        uint16_t len = 0;
+        const uint8_t *desc = validInterface ? reportDesc(setup->wIndex, len) : NULL;
+        if (!input || id != 0 || desc == NULL)
+        {
+            complete_request(Failure, NULL, 0);
+            return;
+        }
+        if (DESCRIPTOR_TYPE(setup->wValue) == REPORT_DESCRIPTOR)
+        {
+            complete_request(Send, const_cast<uint8_t *>(desc), len);
+            return;
+        }
+        if (DESCRIPTOR_TYPE(setup->wValue) == HID_DESCRIPTOR)
+        {
+            const uint8_t hid[] = { HID_DESCRIPTOR_LENGTH, HID_DESCRIPTOR,
+                LSB(HID_VERSION_1_11), MSB(HID_VERSION_1_11), 0, 1,
+                REPORT_DESCRIPTOR, uint8_t(LSB(len)), uint8_t(MSB(len)) };
+            memcpy(_controlBuf, hid, sizeof(hid));
+            complete_request(Send, _controlBuf, sizeof(hid));
+            return;
+        }
+        complete_request(Failure, NULL, 0);
+        return;
+    }
+
+    if (setup->bmRequestType.Type == CLASS_TYPE)
+    {
+        if (!iface || !validInterface || !configured())
+        {
+            complete_request(Failure, NULL, 0);
+            return;
+        }
+        const bool keyboard = setup->wIndex == IFC_ID_KB;
+        switch (setup->bRequest)
+        {
+        case SET_REPORT:
+            // Only output reports exist: unnumbered LedWiz (8 bytes), or
+            // keyboard LEDs (ID + one byte in report protocol, one in boot).
+            if (!input && (setup->wValue >> 8) == 2
+                && ((setup->wIndex == IFC_ID_JS && id == 0 && setup->wLength == 8)
+                    || (keyboard && ((_kbProtocol == 1 && id == REPORT_ID_KB && setup->wLength == 2)
+                        || (_kbProtocol == 0 && id == 0 && setup->wLength == 1)))))
+            {
+                _controlOutput = true;
+                complete_request(Receive, _controlBuf, setup->wLength);
+                return;
+            }
+            break;
+
+        case SET_IDLE:
+            if (!input && keyboard && setup->wLength == 0
+                && (id == 0 || id == REPORT_ID_KB || id == REPORT_ID_MEDIA))
+            {
+                const uint8_t idle = setup->wValue >> 8;
+                if (id == 0 || id == REPORT_ID_KB) kbIdleTime = idle;
+                if (id == 0 || id == REPORT_ID_MEDIA) mediaIdleTime = idle;
+                complete_request(Success, NULL, 0);
+                return;
+            }
+            break;
+
+        case GET_IDLE:
+            if (input && keyboard && (setup->wValue >> 8) == 0 && setup->wLength == 1
+                && (id == REPORT_ID_KB || id == REPORT_ID_MEDIA || (_kbProtocol == 0 && id == 0)))
+            {
+                _controlBuf[0] = id == REPORT_ID_MEDIA ? mediaIdleTime : kbIdleTime;
+                complete_request(Send, _controlBuf, 1);
+                return;
+            }
+            break;
+
+        case 0x0B: // SET_PROTOCOL (boot keyboard)
+            if (!input && keyboard && setup->wLength == 0 && setup->wValue <= 1)
+            {
+                _kbProtocol = setup->wValue;
+                _kbResend = true;
+                complete_request(Success, NULL, 0);
+                return;
+            }
+            break;
+
+        case 0x03: // GET_PROTOCOL
+            if (input && keyboard && setup->wLength == 1 && setup->wValue == 0)
+            {
+                _controlBuf[0] = _kbProtocol;
+                complete_request(Send, _controlBuf, 1);
+                return;
+            }
+            break;
+        }
+        complete_request(Failure, NULL, 0);
+        return;
+    }
+
+    // USBDevice owns standard enumeration/configuration requests.
+    complete_request(PassThrough, NULL, 0);
+}
+
+void USBJoystick::callback_request_xfer_done(const setup_packet_t *setup, bool aborted)
+{
+    bool ok = !aborted;
+    if (_controlOutput && !aborted)
+    {
+        if (setup->wIndex == IFC_ID_JS)
+        {
+            LedWizMsg msg;
+            memcpy(msg.data, _controlBuf, sizeof(msg.data));
+            ok = lwbuf.write(msg);
+        }
+        else if (_kbProtocol != 0)
+        {
+            // Numbered reports carry their ID in the data as well as wValue.
+            ok = _controlBuf[0] == REPORT_ID_KB;
+        }
+    }
+    _controlOutput = false;
+    complete_request_xfer_done(ok);
+}
+
+void USBJoystick::callback_set_interface(uint16_t interface, uint8_t alternate)
+{
+    complete_set_interface(configured() && interface < (useKB ? 3 : 1) && alternate == 0);
+}
+
+void USBJoystick::callback_state_change(DeviceState state)
+{
+    USBHID::callback_state_change(state);
+    if (state != Configured)
+    {
+        kbIdleTime = mediaIdleTime = 0;
+        _kbProtocol = 1;
+        _kbResend = false;
+        _replyTimedOut = false;
+    }
+}
+
+const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
+{
     switch (idx)
     {
     case 0:
@@ -804,6 +1067,19 @@ const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
             len = 0;
             return 0;
         }
+
+    case 2:
+        // Open Pinball Device, which travels with the keyboard.
+        if (useKB)
+        {
+            len = sizeof(reportDescriptorOPD);
+            return reportDescriptorOPD;
+        }
+        else
+        {
+            len = 0;
+            return 0;
+        }
         
     default:
         // Unknown interface ID
@@ -812,7 +1088,7 @@ const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
     }
 } 
  
- const uint8_t *USBJoystick::stringImanufacturerDesc() {
+ const uint8_t *USBJoystick::string_imanufacturer_desc() {
     static const uint8_t stringImanufacturerDescriptor[] = {
         0x0E,                                            /* bLength */
         STRING_DESCRIPTOR,                               /* bDescriptorType 0x03 (String Descriptor) */
@@ -821,7 +1097,7 @@ const uint8_t *USBJoystick::reportDesc(int idx, uint16_t &len)
     return stringImanufacturerDescriptor;
 }
 
-const uint8_t *USBJoystick::stringIserialDesc() 
+const uint8_t *USBJoystick::string_iserial_desc() 
 {
     // set up a buffer with space for the length prefix byte, descriptor type
     // byte, and serial number (as a wide-character string)
@@ -876,7 +1152,7 @@ const uint8_t *USBJoystick::stringIserialDesc()
     return buf;
 }
 
-const uint8_t *USBJoystick::stringIproductDesc() {
+const uint8_t *USBJoystick::string_iproduct_desc() {
     static const uint8_t stringIproductDescriptor[] = {
         0x28,                                                       /*bLength*/
         STRING_DESCRIPTOR,                                          /*bDescriptorType 0x03*/
@@ -889,24 +1165,38 @@ const uint8_t *USBJoystick::stringIproductDesc() {
 
 #define DEFAULT_CONFIGURATION (1)
 
-const uint8_t *USBJoystick::configurationDesc() 
+const uint8_t *USBJoystick::configuration_desc(uint8_t index) 
 {
-    int rptlen0 = reportDescLength(0);
-    int rptlen1 = reportDescLength(1);
+    // One configuration only; Mbed OS 6 asks by index and expects NULL past
+    // the end.
+    if (index != 0)
+        return NULL;
+
+    // mbed 2's USBHID offered reportDescLength(index); the new one has no
+    // index, since it assumes a single report descriptor. Pinscape has two —
+    // joystick and keyboard — and its own reportDesc() already hands back the
+    // length, so ask it.
+    uint16_t rptlen0 = 0, rptlen1 = 0;
+    reportDesc(0, rptlen0);
+    reportDesc(1, rptlen1);
     if (useKB)
     {
+        // Three interfaces now: joystick/LedWiz, keyboard, and Open Pinball
+        // Device. OPD needs only an IN endpoint, so five in total.
+        uint16_t rptlen2 = 0;
+        reportDesc(2, rptlen2);
         const int cfglenKB = 
             ((1 * CONFIGURATION_DESCRIPTOR_LENGTH)
-             + (2 * INTERFACE_DESCRIPTOR_LENGTH)
-             + (2 * HID_DESCRIPTOR_LENGTH)
-             + (4 * ENDPOINT_DESCRIPTOR_LENGTH));
+             + (3 * INTERFACE_DESCRIPTOR_LENGTH)
+             + (3 * HID_DESCRIPTOR_LENGTH)
+             + (5 * ENDPOINT_DESCRIPTOR_LENGTH));
         static uint8_t configurationDescriptorWithKB[] = 
         {
             CONFIGURATION_DESCRIPTOR_LENGTH,// bLength
             CONFIGURATION_DESCRIPTOR,       // bDescriptorType
             LSB(cfglenKB),                  // wTotalLength (LSB)
             MSB(cfglenKB),                  // wTotalLength (MSB)
-            0x02,                           // bNumInterfaces - TWO INTERFACES (JOYSTICK + KEYBOARD)
+            0x03,                           // bNumInterfaces - JOYSTICK + KEYBOARD + OPEN PINBALL DEVICE
             DEFAULT_CONFIGURATION,          // bConfigurationValue
             0x00,                           // iConfiguration
             C_RESERVED | C_SELF_POWERED,    // bmAttributes
@@ -935,7 +1225,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_IN),          // bEndpointAddress - EPINT == EP1
+            _int_in,          // bEndpointAddress - EPINT == EP1
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -943,7 +1233,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_OUT),         // bEndpointAddress - EPINT == EP1
+            _int_out,         // bEndpointAddress - EPINT == EP1
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -957,7 +1247,7 @@ const uint8_t *USBJoystick::configurationDesc()
             0x02,                           // bNumEndpoints
             HID_CLASS,                      // bInterfaceClass
             HID_SUBCLASS_BOOT,              // bInterfaceSubClass
-            HID_PROTOCOL_KB,                // bInterfaceProtocol
+            HID_PROTOCOL_KEYBOARD,                // bInterfaceProtocol
             0x00,                           // iInterface
         
             HID_DESCRIPTOR_LENGTH,          // bLength
@@ -972,7 +1262,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EP4IN),             // bEndpointAddress
+            _kb_in,             // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -980,7 +1270,40 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EP4OUT),            // bEndpointAddress
+            _kb_out,            // bEndpointAddress
+            E_INTERRUPT,                    // bmAttributes
+            LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
+            MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
+            1,                              // bInterval (milliseconds)
+
+            // ***** INTERFACE 2 - OPEN PINBALL DEVICE *****
+            //
+            // One IN endpoint and no OUT: the host only ever reads. Polled at
+            // 1 ms like the others, since nudge is what the simulator's
+            // physics runs on and stale readings show up as lag.
+            INTERFACE_DESCRIPTOR_LENGTH,    // bLength
+            INTERFACE_DESCRIPTOR,           // bDescriptorType
+            0x02,                           // bInterfaceNumber
+            0x00,                           // bAlternateSetting
+            0x01,                           // bNumEndpoints
+            HID_CLASS,                      // bInterfaceClass
+            HID_SUBCLASS_NONE,              // bInterfaceSubClass
+            HID_PROTOCOL_NONE,              // bInterfaceProtocol
+            0x00,                           // iInterface
+
+            HID_DESCRIPTOR_LENGTH,          // bLength
+            HID_DESCRIPTOR,                 // bDescriptorType
+            LSB(HID_VERSION_1_11),          // bcdHID (LSB)
+            MSB(HID_VERSION_1_11),          // bcdHID (MSB)
+            0x00,                           // bCountryCode
+            0x01,                           // bNumDescriptors
+            REPORT_DESCRIPTOR,              // bDescriptorType
+            LSB(rptlen2),                   // wDescriptorLength (LSB)
+            MSB(rptlen2),                   // wDescriptorLength (MSB)
+
+            ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
+            ENDPOINT_DESCRIPTOR,            // bDescriptorType
+            _opd_in,                        // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -988,7 +1311,14 @@ const uint8_t *USBJoystick::configurationDesc()
 
         };
 
-        // Keyboard + joystick interfaces
+        // wTotalLength is written from cfglenKB, so the two have to agree: a
+        // descriptor that declares the wrong length is rejected by the host
+        // with nothing to say why. Cheap to assert, and it catches exactly the
+        // mistake an added interface invites.
+        static_assert(sizeof(configurationDescriptorWithKB) == cfglenKB,
+                      "configuration descriptor length does not match wTotalLength");
+
+        // Joystick + keyboard + Open Pinball Device
         return configurationDescriptorWithKB;
     }
     else
@@ -1033,7 +1363,7 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_IN),          // bEndpointAddress
+            _int_in,          // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
@@ -1041,12 +1371,15 @@ const uint8_t *USBJoystick::configurationDesc()
         
             ENDPOINT_DESCRIPTOR_LENGTH,     // bLength
             ENDPOINT_DESCRIPTOR,            // bDescriptorType
-            PHY_TO_DESC(EPINT_OUT),         // bEndpointAddress
+            _int_out,         // bEndpointAddress
             E_INTERRUPT,                    // bmAttributes
             LSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (LSB)
             MSB(MAX_PACKET_SIZE_EPINT),     // wMaxPacketSize (MSB)
             1                               // bInterval (milliseconds)
         };
+
+        static_assert(sizeof(configurationDescriptorNoKB) == cfglenNoKB,
+                      "configuration descriptor length does not match wTotalLength");
 
         return configurationDescriptorNoKB;
     }
@@ -1054,29 +1387,120 @@ const uint8_t *USBJoystick::configurationDesc()
 
 // Set the configuration.  We need to set up the endpoints for
 // our active interfaces.
-bool USBJoystick::USBCallback_setConfiguration(uint8_t configuration) 
+void USBJoystick::callback_set_configuration(uint8_t configuration)
 {
-    // we only have one valid configuration
+    // The base class owns the joystick/LedWiz pair: it adds both endpoints and
+    // arms reception on the OUT one. Doing it here as well would add them twice.
     if (configuration != DEFAULT_CONFIGURATION)
-        return false;
-        
-    // Configure endpoint 1 - we use this in all cases, for either
-    // the combined joystick/ledwiz interface or just the ledwiz interface
-    addEndpoint(EPINT_IN, MAX_REPORT_JS_TX + 1);
-    addEndpoint(EPINT_OUT, MAX_REPORT_JS_RX + 1);
-    readStart(EPINT_OUT, MAX_REPORT_JS_TX + 1);
-    
-    // if the keyboard is enabled, configure endpoint 4 for the kb interface
+    {
+        complete_set_configuration(false);
+        return;
+    }
+    USBHID::callback_set_configuration(configuration);
+
+    // The keyboard interface is a second pair on top, when any button is set up
+    // as a key. mbed 2 named these endpoints; they are allocated now, so the
+    // addresses come from the resolver in the constructor.
     if (useKB)
     {
-        addEndpoint(EP4IN, MAX_REPORT_KB_TX + 1);
-        addEndpoint(EP4OUT, MAX_REPORT_KB_RX + 1);
-        readStart(EP4OUT, MAX_REPORT_KB_TX + 1);
-    }
+        endpoint_add(_kb_in, MAX_REPORT_KB_TX + 1, USB_EP_TYPE_INT,
+                     &USBJoystick::_kb_send_isr);
+        endpoint_add(_kb_out, MAX_REPORT_KB_RX + 1, USB_EP_TYPE_INT,
+                     &USBJoystick::_kb_read_isr);
+        read_start(_kb_out, _kb_out_buf, MAX_REPORT_KB_RX + 1);
 
-    // success
-    return true;
+        // Open Pinball Device travels with the keyboard. IN only, so there is
+        // nothing to arm for reception.
+        endpoint_add(_opd_in, OPD_REPORT_SIZE + 1, USB_EP_TYPE_INT,
+                     &USBJoystick::_opd_send_isr);
+    }
 }
+
+// The Open Pinball Device struct label.
+//
+// OPD identifies its report layout, and its version, by this string rather
+// than by VID/PID -- the specification says so explicitly, since the whole
+// point is that any vendor can implement it. A host matches only up to the
+// '/' and reads what follows as Major.Minor, so a later revision can append
+// fields without breaking readers built against this one.
+//
+// It sits at the configuration string index because Mbed dispatches only the
+// six standard indices and Pinscape uses none for the configuration. Once
+// mbed-ce/mbed-os#622 lands this can move to an index of its own.
+const uint8_t *USBJoystick::string_iconfiguration_desc()
+{
+    static const char label[] = OPD_STRUCT_STRDESC;
+    static const size_t nChars = sizeof(label) - 1;
+
+    // USB string descriptors are UTF-16LE, with a two-byte header. The label
+    // is ASCII, so the high byte of each character is zero.
+    static uint8_t desc[2 + nChars*2];
+    desc[0] = sizeof(desc);
+    desc[1] = STRING_DESCRIPTOR;
+    for (size_t i = 0; i < nChars; ++i)
+    {
+        desc[2 + i*2] = static_cast<uint8_t>(label[i]);
+        desc[3 + i*2] = 0;
+    }
+    return desc;
+}
+
+// Send one Open Pinball Device report.
+//
+// Fire and forget, like the keyboard reports: a dropped nudge sample is of no
+// consequence next to blocking the main loop, which runs the plunger and the
+// button scan.
+bool USBJoystick::sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
+                          int16_t ax, int16_t ay, int16_t vx, int16_t vy,
+                          int16_t plungerPos, int16_t plungerSpeed)
+{
+    // Nothing to send to if the interface was not configured.
+    if (!useKB)
+        return false;
+
+    // The report ID prefixes the struct on the wire.
+    uint8_t buf[1 + OPD_REPORT_SIZE];
+    uint8_t *p = buf;
+    *p++ = OPD_REPORT_ID;
+
+    // The timestamp is microseconds from an arbitrary origin; the host uses it
+    // to order and interpolate samples, never as a wall clock.
+    // Mbed extends the hardware counter across wraparound, including intervals
+    // when OPD reporting is paused. A cast of us_ticker_read() cannot do that.
+    opdPutU64(p, ticker_read_us(get_us_ticker_data()));
+    opdPutU32(p, genericButtons);
+    opdPutU32(p, pinballButtons);
+    opdPutI16(p, ax);
+    opdPutI16(p, ay);
+    opdPutI16(p, vx);
+    opdPutI16(p, vy);
+    opdPutI16(p, plungerPos);
+    opdPutI16(p, plungerSpeed);
+
+    return write_start(_opd_in, buf, sizeof(buf));
+}
+
+// Completion of an Open Pinball Device IN transfer.
+void USBJoystick::_opd_send_isr()
+{
+    write_finish(_opd_in);
+}
+
+// Completion of a keyboard IN transfer. Nothing to do but let the endpoint go:
+// the reports are fire-and-forget, as they were under the old writeTO().
+void USBJoystick::_kb_send_isr()
+{
+    write_finish(_kb_in);
+}
+
+// A packet arrived on the keyboard OUT endpoint. The old EP4_OUT_callback did
+// the same thing: take it, and arm the next read.
+void USBJoystick::_kb_read_isr()
+{
+    read_finish(_kb_out);
+    read_start(_kb_out, _kb_out_buf, MAX_REPORT_KB_RX + 1);
+}
+
 
 // Handle incoming messages on the joystick/LedWiz interface = endpoint 1.
 // This interface receives LedWiz protocol commands and commands using our
@@ -1087,36 +1511,40 @@ bool USBJoystick::USBCallback_setConfiguration(uint8_t configuration)
 // from the interrupt handler using the rule that only the interrupt 
 // handler can change the write pointer, and only the regular code can
 // change the read pointer.
-bool USBJoystick::EP1_OUT_callback()
+// A report arrived on the joystick/LedWiz OUT endpoint.
+//
+// The base class reads it and calls this, where mbed 2 handed over the endpoint
+// and left the draining to us. The circular buffer still crosses the interrupt
+// boundary the same way: only this handler moves the write pointer, only the
+// main loop moves the read pointer.
+//
+// The keyboard OUT endpoint carried indicator-LED updates that were read only
+// to keep the pipe open; _kb_read_isr does that now, and discards them as
+// before.
+void USBJoystick::report_rx()
 {
-    // Read this message
-    union {
+    HID_REPORT report;
+    if (!read_nb(&report))
+        return;
+
+    // A LedWiz message is exactly eight bytes; anything else is not one.
+    if (report.length == 8)
+    {
         LedWizMsg msg;
-        uint8_t buf[MAX_HID_REPORT_SIZE];
-    } buf;
-    uint32_t bytesRead = 0;
-    USBDevice::readEP(EP1OUT, buf.buf, &bytesRead, MAX_HID_REPORT_SIZE);
-    
-    // if it's the right length, queue it to our circular buffer
-    if (bytesRead == 8)
-        lwbuf.write(buf.msg);
-
-    // start the next read
-    return readStart(EP1OUT, MAX_HID_REPORT_SIZE);
+        memcpy(&msg, report.data, sizeof(msg));
+        lwbuf.write(msg);
+    }
 }
 
-// Handle incoming messages on the keyboard interface = endpoint 4.
-// The host uses this to send updates for the keyboard indicator LEDs
-// (caps lock, num lock, etc).  We don't do anything with these, but
-// we have to read them to keep the pipe open.
-bool USBJoystick::EP4_OUT_callback() 
+
+
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+// Bench diagnostics only. Never print from the USB interrupt callback.
+void USBJoystick::reportNudgeDiagnostics() const
 {
-    // read this message
-    uint32_t bytesRead = 0;
-    uint8_t led[MAX_HID_REPORT_SIZE];
-    USBDevice::readEP(EP4OUT, led, &bytesRead, MAX_HID_REPORT_SIZE);
-
-    // start the next read
-    return readStart(EP4OUT, MAX_HID_REPORT_SIZE);
+    printf("Nudge USB: enabled=%u format=%u completed=%lu axes=%d,%d,%d,%d,%d,%d,%d\r\n",
+        unsigned(enableJoystick), unsigned(axisFormat),
+        static_cast<unsigned long>(_diagCompletedReports),
+        int(_x), int(_y), int(_z), int(_vx), int(_vy), int(_vz), int(_z0));
 }
-
+#endif

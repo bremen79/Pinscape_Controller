@@ -137,12 +137,12 @@ uint32_t remaining(int channel = -1);
 * @param function - function to call upon completion (may be a member function)
 */
 void attach(void (*function)(void)) {
-    _callback.attach(function);
+    _callback = callback(function);
     }
     
 template<typename T>
     void attach(T *object, void (T::*member)(void)) {
-        _callback.attach(object, member);
+        _callback = callback(object, member);
     }
     
 /**
@@ -179,10 +179,10 @@ void link(SimpleDMA &dest1, SimpleDMA &dest2);
 * @param length - number of BYTES to be moved by the DMA
 */
 void wait(int length) {
-    id = Thread::gettid();
+    id = ThisThread::get_id();
     this->attach(this, &SimpleDMA::waitCallback);
-    this->start(length);
-    Thread::signal_wait(0x1);
+    this->start(length, false);
+    ThisThread::flags_wait_any(0x1);
 }
 #endif
 
@@ -202,7 +202,9 @@ uint8_t linkMode : 2;
 
 
 //IRQ handlers
-FunctionPointer _callback;
+// Was FunctionPointer in mbed 2. Callback is its replacement, and it is
+// assigned rather than attached.
+Callback<void()> _callback;
 void irq_handler(void);
 
 static SimpleDMA *irq_owner[DMA_CHANNELS];
@@ -220,9 +222,10 @@ static void irq_handler3( void );
 int getFreeChannel(void);
 
 #ifdef RTOS_H
-osThreadId id;
+osThreadId_t id;
 void waitCallback(void) {
-    osSignalSet(id, 0x1);    
+    // Was osSignalSet: signals became thread flags.
+    osThreadFlagsSet(id, 0x1);    
 }
 #endif
 };

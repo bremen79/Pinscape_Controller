@@ -545,7 +545,7 @@ private:
         uint32_t dtNext = dt < tIntMin ? tIntMin - dt : 1;
 
         // Schedule the next transfer
-        integrationTimeout.attach_us(this, &TSL14xx::startTransfer, dtNext);
+        integrationTimeout.attach_us(callback(this, &TSL14xx::startTransfer), dtNext);
     }
 
     // Clear the sensor shift register.  Clocks in all of the pixels from

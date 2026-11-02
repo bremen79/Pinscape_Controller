@@ -1,0 +1,34 @@
+{
+    /*
+       KL25Z with USB device support switched on.
+
+       The stock KL25Z does not list USBDEVICE in its device_has, so
+       drivers/usb is never built for it and USBHID.h cannot be found --
+       even though Mbed CE ships a Kinetis USB driver that names this board
+       first in its guard (targets/TARGET_Freescale/USBPhy_Kinetis.cpp).
+
+       That guard covers six boards: KL25Z, KL43Z, KL46Z, K64F, K22F, K82F.
+       Only two of them declare USBDEVICE -- KL43Z and K82F -- and those two
+       are exactly the ones carrying the KSDK2_MCUS label, i.e. the ones
+       ported to NXP's own SDK. The correlation is perfect across all six.
+
+       The driver says why: it includes fsl_common.h only under
+       TARGET_KSDK2_MCUS, and that header is where NULL and memset come from.
+       On a non-KSDK2 board the file does not even compile -- which is how we
+       found it. So the four older Kinetis targets were never enabled and
+       never built; their names survive in the guard as inherited text from
+       the USBHAL layer that preceded the USBPhy API (Mbed OS 5.10).
+
+       This is not a Mbed CE regression. ARM's own mbed-os has the same six
+       names in the same guard and the same two USBDEVICE declarations.
+
+       Pinscape exists to present a USB device, so it cannot build without
+       one. This target inherits everything from the stock KL25Z and adds
+       only the missing capability. The board has a full-speed USB device
+       controller; nothing about the silicon justifies the omission.
+    */
+    "PINSCAPE_KL25Z": {
+        "inherits": ["KL25Z"],
+        "device_has_add": ["USBDEVICE"],
+    },
+}

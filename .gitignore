@@ -25,4 +25,14 @@ compile_commands?json
 ?mbed
 USBDevice
 FastPWM
-FastIO
+FastIObuild/
+mbed-os
+
+# Local build outputs and debugging artifacts
+/build/
+/Pinscape_Controller_*.bin
+/changes-since-last-commit.patch
+/photo1.jpg
+/photo2.jpg
+__pycache__/
+*.py[cod]

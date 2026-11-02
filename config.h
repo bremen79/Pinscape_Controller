@@ -1,3 +1,7 @@
+// Pin names below come from mbed; the online compiler included this
+// globally, so the header never had to ask for it.
+#include "mbed.h"
+
 // Pinscape Controller Configuration
 //
 // !!! ATTENTION !!! 
@@ -38,8 +42,11 @@
 // the firmware.  Use the Config Tool on your Windows PC instead.
 #define STANDARD_CONFIG       1     // standard settings, based on v1 base settings
 #define TEST_CONFIG_EXPAN     0     // configuration for the expansion boards
-#define TEST_KEEP_PRINTF      0     // for debugging purposes, keep printf() enabled
-                                    // by leaving the SDA UART GPIO pins unallocated
+#define TEST_KEEP_PRINTF      1     // reserve SDA UART pins in factory defaults
+// Keep the port's existing default pin map: outputs 1 and 2 are NC. This does
+// not enable the UART in a release build. Only PINSCAPE_CRASH_DIAGNOSTICS=ON
+// enables it in Mbed. The diagnostic build checks the saved configuration
+// before allowing UART output, and stays silent if either pin is assigned.
 
 // Plunger type codes
 // NOTE!  These values are part of the external USB interface.  New

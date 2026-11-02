@@ -525,7 +525,7 @@ private:
         // never happen, but it wouldn't be a problem even if it happened with
         // some regularity, because we'd just transmit the data on the next
         // cycle.)
-        windowTimer.attach_us(this, &TLC5940::closeSendWindow, 
+        windowTimer.attach_us(callback(this, &TLC5940::closeSendWindow), 
             uint32_t((1.0f/GSCLK_SPEED)*4096.0f*2.0f/3.0f*1000000.0f));
 #endif
 
@@ -567,7 +567,7 @@ private:
     // arm the reset handler - this fires at the end of each GS cycle    
     void armReset()
     {
-        resetTimer.attach_us(this, &TLC5940::reset, 
+        resetTimer.attach_us(callback(this, &TLC5940::reset), 
             uint32_t((1.0/GSCLK_SPEED)*4096.0*1000000.0f));
     }
     

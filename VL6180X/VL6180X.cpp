@@ -51,7 +51,7 @@ bool VL6180X::init()
     writeReg8(VL6180X_SYSTEM_FRESH_OUT_OF_RESET, 0);
         
     // give the device 50ms before sending the startup sequence
-    wait_ms(50);
+    wait_us((50) * 1000);
     
     // Send the mandatory initial register assignments, per the manufacturer's app notes:
     // http://www.st.com/st-web-ui/static/active/en/resource/technical/document/application_note/DM00122600.pdf

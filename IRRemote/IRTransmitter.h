@@ -390,7 +390,7 @@ protected:
                 // The handler returned a positive time value, so it has
                 // more work to do.  That means we're done here - just set
                 // the next timeout and exit the interrupt handler.
-                txTimeout.attach_us(this, &IRTransmitter::txThread, t);
+                txTimeout.attach_us(callback(this, &IRTransmitter::txThread), t);
                 return;
             }
             else
@@ -444,7 +444,7 @@ protected:
                 
                 // set the timer for the next step of the transmission, then
                 // we're done
-                txTimeout.attach_us(this, &IRTransmitter::txThread, t);
+                txTimeout.attach_us(callback(this, &IRTransmitter::txThread), t);
                 return;
             }
         }

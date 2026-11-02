@@ -7,6 +7,7 @@
 #define USBJOYSTICK_H
  
 #include "USBHID.h"
+#include "usb_phy_api.h"
 #include "circbuf.h"
 
 // Bufferd incoming LedWiz message structure
@@ -83,6 +84,12 @@ enum JOY_BUTTON {
  */
  
  
+// Maximum report sizes. Mbed OS 6 hands read_start() a buffer of the
+// caller's own, so the class needs these where its members are declared.
+const int MAX_REPORT_JS_RX = 8;
+const int MAX_REPORT_KB_TX = 8;
+const int MAX_REPORT_KB_RX = 4;
+
 class USBJoystick: public USBHID 
 {
 public:
@@ -106,15 +113,27 @@ public:
      * @param axisFormat an AXIS_FORMAT_xxx value specifying the joystick axis report format
      * @param useKB enable the USB keyboard reporting interface
      */
-    USBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release, 
+    USBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release,
         int waitForConnect, bool enableJoystick, int axisFormat, bool useKB)
-        : USBHID(16, 64, vendor_id, product_id, product_release, false)
+        // Mbed OS 6 reordered these: the first parameter of the simple
+        // constructor is connect_blocking, not the report length, so the mbed 2
+        // argument list silently mapped 16 onto a bool, the vendor id onto an
+        // 8-bit report length, and shifted the ids along by one.
+        //
+        // A derived class must use the USBPhy form regardless.  The other one
+        // connects during the base constructor, before this class's vtable
+        // exists, so the device would answer descriptor requests with USBHID's
+        // own -- not the joystick/LedWiz ones.  We call connect() below, once
+        // the object is whole.
+        : USBHID(get_usb_phy(), 16, 64, vendor_id, product_id, product_release)
     { 
         _init();
         this->useKB = useKB;
         this->enableJoystick = enableJoystick;
         this->axisFormat = axisFormat;
-        connect(waitForConnect);
+        // Mbed OS 6 dropped the blocking flag; state is reported by callback.
+        (void)waitForConnect;
+        connect();
     };
 
     /* read a report from the LedWiz buffer */
@@ -141,6 +160,10 @@ public:
      * currently pressed.  See the HID report descriptor for the order of bits.
      */
     bool mediaUpdate(uint8_t data);
+
+    // HID idle periods repeat the current state; this is not an event queue.
+    bool kbIdleExpired() const;
+    bool mediaIdleExpired() const;
      
     /**
      * Update the joystick status
@@ -205,6 +228,28 @@ public:
      * @param chB channel "B" reading
      */
     bool sendPlungerStatusQuadrature(int chA, int chB);
+
+    /**
+     * Send an Open Pinball Device report.
+     *
+     * OPD is a vendor-neutral interface for pinball cabinet controls: nudge,
+     * plunger and buttons, in a layout fixed by its specification rather than
+     * by us. Pinball software reading it needs to know nothing about this
+     * board -- the spec deliberately refuses even VID/PID matching.
+     *
+     * @param genericButtons  32 general-purpose buttons, one bit each
+     * @param pinballButtons  32 pre-assigned pinball buttons (OPD_BTN_xxx)
+     * @param ax,ay           nudge acceleration
+     * @param vx,vy           nudge velocity
+     * @param plungerPos      plunger position, +32767 = fully retracted
+     * @param plungerSpeed    plunger speed
+     */
+    bool sendOPD(uint32_t genericButtons, uint32_t pinballButtons,
+                 int16_t ax, int16_t ay, int16_t vx, int16_t vy,
+                 int16_t plungerPos, int16_t plungerSpeed);
+
+    /** Is the Open Pinball Device interface present in this configuration? */
+    bool opdEnabled() const { return useKB; }
     
     /**
      * Send a VCNL4010 sensor extra status report
@@ -348,53 +393,71 @@ public:
      */
     bool buttons(uint32_t buttons);
 
-    /* USB descriptor overrides */
-    virtual const uint8_t *configurationDesc();
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    void reportNudgeDiagnostics() const;
+#endif
+
+    /* USB descriptor overrides
+     *
+     * Mbed OS 6 renamed every one of these, so the mbed 2 spellings below
+     * silently stopped overriding anything: the device answered with USBHID's
+     * own descriptors and enumerated as "mbed.org HID DEVICE", a generic HID
+     * rather than a joystick.
+     */
+    virtual const uint8_t *configuration_desc(uint8_t index);
     virtual const uint8_t *reportDesc(int idx, uint16_t &len);
 
     /* USB descriptor string overrides */
-    virtual const uint8_t *stringImanufacturerDesc();
-    virtual const uint8_t *stringIserialDesc();
-    virtual const uint8_t *stringIproductDesc();
-     
-    /* set/get idle time */
-    virtual void setIdleTime(int ifc, int rptid, int t)
-    {
-        // Remember the new value if operating on the keyboard.  Remember
-        // separate keyboard and media control idle times, in case the
-        // host wants separate report rates.
-        if (ifc == IFC_ID_KB)
-        {
-            if (rptid == REPORT_ID_KB)
-                kbIdleTime = t;
-            else if (rptid == REPORT_ID_MEDIA)
-                mediaIdleTime = t;
-        }
-    }
-    virtual uint8_t getIdleTime(int ifc, int rptid)
-    {
-        // Return the kb idle time if the kb interface is the one requested.
-        if (ifc == IFC_ID_KB)
-        {
-            if (rptid == REPORT_ID_KB)
-               return kbIdleTime;
-            if (rptid == REPORT_ID_MEDIA)
-               return mediaIdleTime;
-        }
-        
-        // we don't use idle times for other interfaces or report types
-        return 0;
-    }
-     
+    virtual const uint8_t *string_imanufacturer_desc();
+    virtual const uint8_t *string_iserial_desc();
+    virtual const uint8_t *string_iproduct_desc();
+
+    // The Open Pinball Device report descriptor labels its data block with a
+    // string index, and the host identifies the structure -- and its version --
+    // by that string rather than by VID/PID. Mbed only dispatches the six
+    // standard string indices, and Pinscape leaves the configuration string
+    // unused, so the label lives there. (Proposed upstream as
+    // mbed-ce/mbed-os#622, which would allow an index of our own.)
+    virtual const uint8_t *string_iconfiguration_desc();
+
+    // Handle all HID interfaces here: Mbed's base handler assumes one interface.
+    void callback_request(const setup_packet_t *setup) override;
+    void callback_request_xfer_done(const setup_packet_t *setup, bool aborted) override;
+
     /* callback overrides */
-    virtual bool USBCallback_setConfiguration(uint8_t configuration);
-    virtual bool USBCallback_setInterface(uint16_t interface, uint8_t alternate)
-        { return interface == 0 || interface == 1; }
-        
-    virtual bool EP1_OUT_callback();
-    virtual bool EP4_OUT_callback();
+
+    // Endpoints are added here. The base class handles the joystick/LedWiz
+    // pair; the keyboard pair is ours, since USBHID manages only one.
+    virtual void callback_set_configuration(uint8_t configuration) override;
+
+    // Every advertised interface has only alternate setting zero.
+    void callback_set_interface(uint16_t interface, uint8_t alternate) override;
+    void callback_state_change(DeviceState state) override;
+
+    // A completed IN packet means the host is reading again after a timeout.
+    void report_tx() override
+    {
+        _replyTimedOut = false;
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+        ++_diagCompletedReports;
+#endif
+    }
+
+    // A report arrived on the joystick/LedWiz endpoint. Was EP1_OUT_callback,
+    // which had to do its own reading; the base class reads it now.
+    virtual void report_rx() override;
+
+    // Transfer completions on the keyboard endpoints. mbed 2 named callbacks
+    // after endpoint numbers; they are registered per endpoint now.
+    void _kb_send_isr();
+    void _kb_read_isr();
+    void _opd_send_isr();
+
      
 private:
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    volatile uint32_t _diagCompletedReports = 0;
+#endif
 
     // Incoming LedWiz message buffer.  Each LedWiz message is exactly 8 bytes.
     CircBuf<LedWizMsg, 16> lwbuf;
@@ -404,15 +467,43 @@ private:
     
     // joystick axis reporting format
     int axisFormat;
-    
+
     // enable the keyboard interface for button inputs
     bool useKB;
     
     // keyboard maximum idle time between reports
-    uint8_t kbIdleTime;
+    volatile uint8_t kbIdleTime = 0;
+    volatile uint8_t _kbProtocol = 1; // report protocol; zero is boot protocol
+    volatile bool _kbResend = false;
+    uint32_t _kbLastSend = 0;
+    uint32_t _mediaLastSend = 0;
+
+    // EP0 needs its own persistent buffer, separate from interrupt OUT reads.
+    uint8_t _controlBuf[HID_DESCRIPTOR_LENGTH] = { 0 };
+    bool _controlOutput = false;
+    volatile bool _replyTimedOut = false;
+    bool sendReply(const HID_REPORT *report);
+
+    // Endpoints for the keyboard interface. USBHID provides one pair of its
+    // own for the joystick; the keyboard is a second interface on this same
+    // device, so its pair is ours to allocate and to feed. Both stay unused
+    // when useKB is false, which is the case on a board whose buttons are all
+    // joystick buttons.
+    usb_ep_t _kb_in = 0;
+    usb_ep_t _kb_out = 0;
+
+    // Endpoint for the Open Pinball Device interface. IN only: the host never
+    // sends anything on it. Bundled with the keyboard rather than separately
+    // switchable, so a cabinet with LedWiz compatibility trouble strips down to
+    // the joystick interface alone in one step.
+    usb_ep_t _opd_in = 0;
+
+    // Reception buffer for the keyboard endpoint. read_start() needs somewhere
+    // to put a packet before the callback runs.
+    uint8_t _kb_out_buf[MAX_REPORT_KB_RX + 1] = { 0 };
     
     // media maximum idle time between reports
-    uint8_t mediaIdleTime;
+    volatile uint8_t mediaIdleTime = 0;
     
     // current X, Y, Z axis values
     int16_t _x;                       

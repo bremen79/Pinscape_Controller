@@ -301,6 +301,7 @@
 
 
 #define DECL_EXTERNS
+#include "Version.h"
 #include "config.h"
 
 
@@ -308,7 +309,8 @@
 // 
 // placement new
 //
-void* operator new (size_t, void *p) { return p; }
+// Placement new comes from <new> these days; defining it again is an error.
+#include <new>
 
 
 // --------------------------------------------------------------------------
@@ -346,7 +348,15 @@ const char *getOpenSDAID()
     static const char OpenSDA[] = OPENSDA_PREFIX "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0///";
     const size_t OpenSDA_prefix_length = sizeof(OPENSDA_PREFIX) - 1;
     
-    return OpenSDA + OpenSDA_prefix_length;
+    // The TUID is written into the .bin after linking, so the zeroes the
+    // compiler sees above are not what sits in flash at run time.  GCC is
+    // entitled to propagate them into every use of this pointer, which would
+    // make the board report an empty ID no matter what the tool patched in.
+    // Hiding the pointer's origin forces a real load.  ARM Compiler did not
+    // need this, which is why the original had no such precaution.
+    const char *p = OpenSDA + OpenSDA_prefix_length;
+    __asm__ volatile ("" : "+r"(p));
+    return p;
 }
 
 // --------------------------------------------------------------------------
@@ -399,7 +409,8 @@ inline int square(int x) { return x*x; }
 inline float square(float x) { return x*x; }
 
 // floating point rounding
-inline float round(float x) { return x > 0 ? floor(x + 0.5) : ceil(x - 0.5); }
+// Was round(): the standard library now provides one, and the two collide.
+inline float roundToNearest(float x) { return x > 0 ? floor(x + 0.5) : ceil(x - 0.5); }
 
 
 // --------------------------------------------------------------------------
@@ -426,7 +437,20 @@ private:
 // 
 // USB product version number
 //
-const uint16_t USB_VERSION_NO = 0x000A;
+// USB device release number -- the bcdDevice field of the device descriptor.
+//
+// This is the standard place for a firmware version, and it costs nothing to
+// fill in: it sits beside iManufacturer and iProduct in the same descriptor,
+// so a host reads all three from one enumeration. hidapi surfaces it as
+// hid_device_info::release_number, and SDL as SDL_GetJoystickFirmwareVersion().
+// A version is only meaningful next to the name of the thing being versioned,
+// and that is exactly where this one lands.
+//
+// BCD, two digits of major and two of minor, so 2.1.0 reads as 0x0210. The
+// patch level shares the low byte; it is there for completeness rather than to
+// be relied on, since 16 bits cannot hold three independent components.
+const uint16_t USB_VERSION_NO =
+    static_cast<uint16_t>((VERSION_MAJOR << 8) | (VERSION_MINOR << 4) | VERSION_PATCH);
 
 // --------------------------------------------------------------------------
 //
@@ -3130,7 +3154,9 @@ struct ButtonState
     uint8_t dbState;
     
     // current PHYSICAL on/off state, after debouncing
-    uint8_t physState : 1;
+    // Written only by scanButtons(). A separate volatile byte prevents the
+    // main loop's logical bitfield updates from overwriting an interrupt update.
+    volatile uint8_t physState;
     
     // current LOGICAL on/off state as reported to the host.
     uint8_t logState : 1;
@@ -3219,18 +3245,26 @@ void scanButtons()
     ButtonState *bs = buttonState, *last = bs + nButtons;
     for ( ; bs < last ; ++bs)
     {
-        // Shift the new state into the debounce history
-        uint8_t db = (bs->dbState << 1) | bs->di.read();
-        bs->dbState = db;
-        
-        // If we have all 0's or 1's in the history for the required
-        // debounce period, the key state is stable, so apply the new
-        // physical state.  Note that the pins are active low, so the
-        // new button on/off state is the inverse of the GPIO state.
-        const uint8_t stable = 0x1F;   // 00011111b -> low 5 bits = last 5 readings
-        db &= stable;
-        if (db == 0 || db == stable)
-            bs->physState = !db;
+        // Immediate press, 5 consecutive samples for release
+        if (bs->di.read() == 0)
+        {
+            // Press immediately
+            bs->physState = 1;
+            bs->dbState = 0;
+        }
+        else if (bs->physState)
+        {
+            // Wait for 5 consecutive released samples
+            if (++bs->dbState >= 5)
+            {
+                bs->physState = 0;
+                bs->dbState = 0;
+            }
+        }
+        else
+        {
+            bs->dbState = 0;
+        }
     }
 }
 
@@ -3840,6 +3874,9 @@ void reportButtonStatus(USBJoystick &js)
         
         // pack it into the appropriate bit
         int idx = bs->cfgIndex;
+        // Virtual buttons have configuration slots beyond the physical inputs.
+        if (idx >= MAX_BUTTONS)
+            continue;
         int si = idx / 8;
         int shift = idx & 0x07;
         state[si] |= b << shift;
@@ -3858,7 +3895,7 @@ class MyUSBJoystick: public USBJoystick
 {
 public:
     MyUSBJoystick(uint16_t vendor_id, uint16_t product_id, uint16_t product_release,
-        bool waitForConnect, bool enableJoystick, int axisFormat, bool useKB) 
+        bool waitForConnect, bool enableJoystick, int axisFormat, bool useKB)
         : USBJoystick(vendor_id, product_id, product_release, waitForConnect, enableJoystick, axisFormat, useKB)
     {
         sleeping_ = false;
@@ -4002,61 +4039,40 @@ public:
     // less than second with this code in place.
     void recoverConnection()
     {
-        // if a reconnect is pending, reconnect
-        if (reconnectPending_)
+        // Poll the delay without blocking other device work. Keep the test and
+        // flag update atomic with respect to USB suspend interrupts.
+        CriticalSectionLock lock;
+        if (reconnectPending_
+            && uint32_t(uint32_t(timer_.read_us()) - lastSleepTime_) >= 5000)
         {
-            // Loop until we reach 5ms after the last sleep event.
-            for (bool done = false ; !done ; )
-            {
-                // If we've reached the target time, reconnect.  Do the
-                // time check and flag reset atomically, so that we can't
-                // have another sleep event sneak in after we've verified
-                // the time.  If another event occurs, it has to happen
-                // before we check, in which case it'll update the time
-                // before we check it, or after we clear the flag, in
-                // which case it will reset the flag and we'll do another
-                // round the next time we call this routine.
-                __disable_irq();
-                if (uint32_t(timer_.read_us() - lastSleepTime_) > 5000)
-                {
-                    connect(false);
-                    reconnectPending_ = false;
-                    done = true;
-                }
-                __enable_irq();
-            }
+            reconnectPending_ = false;
+            connect();
         }
     }
-    
+
 protected:
-    // Handle a USB SLEEP interrupt.  This interrupt signifies that the
-    // USB hardware module hasn't seen any token traffic for 3ms, which 
-    // means that we're either physically or logically disconnected. 
-    //
-    // Important: this runs in ISR context.
-    //
-    // Note that this is a specialized sense of "sleep" that's unrelated 
-    // to the similarly named power modes on the PC.  This has nothing
-    // to do with suspend/sleep mode on the PC, and it's not a low-power
-    // mode on the KL25Z.  They really should have called this interrupt 
-    // DISCONNECT or BROKEN CONNECTION.)
-    virtual void sleepStateChanged(unsigned int sleeping)
-    { 
-        // note the new state
+    // Mbed CE delivers the hardware sleep/resume event through USBPhyEvents.
+    // Disconnecting on sleep also aborts pending HID sends, allowing the main
+    // loop to shut down outputs and run the reconnect logic.
+    void suspend(bool sleeping) override
+    {
         sleeping_ = sleeping;
-        
-        // If we have a non-zero bus address, we have at least a partial
-        // connection to the host (we've made it at least as far as the
-        // SETUP stage).  Explicitly disconnect, and the pending reconnect
-        // flag, and remember the time of the sleep event.
-        if (USB0->ADDR != 0x00)
+        if (sleeping && USB0->ADDR != 0x00)
         {
             disconnect();
-            lastSleepTime_ = timer_.read_us();
+            lastSleepTime_ = uint32_t(timer_.read_us());
             reconnectPending_ = true;
         }
     }
-    
+
+    void callback_state_change(DeviceState state) override
+    {
+        USBJoystick::callback_state_change(state);
+        // A fresh enumeration need not generate a hardware RESUME interrupt.
+        if (state == Configured)
+            sleeping_ = false;
+    }
+
     // is the USB connection asleep?
     volatile bool sleeping_; 
     
@@ -4165,7 +4181,7 @@ struct AccHist
 class Accel
 {
 public:
-    Accel(const Config &cfg) : mma_(MMA8451_SDA_PIN, MMA8451_SCL_PIN, MMA8451_I2C_ADDRESS)        
+    Accel(const Config &cfg) : mma_(MMA8451_SDA_PIN, MMA8451_SCL_PIN, MMA8451_I2C_ADDRESS, false)
     {
         // no manual centering request has been received
         manualCenterRequest_ = false;
@@ -4242,6 +4258,11 @@ public:
     // it at all.
     static void softReset(Accel *accel, const Config &config)
     {
+        // A disconnected or failed sensor must not force a reset on every
+        // main-loop iteration. Retry at most once per second, across wrap.
+        if (uint32_t(us_ticker_read() - accel->lastResetAttempt_) < 1000000)
+            return;
+
         // save the current centering position, so that the user
         // doesn't see a jump across the reset
         int cx = accel->cx_, cy = accel->cy_;
@@ -4262,8 +4283,11 @@ public:
         // all states should eventually lead back to the base
         // "listening" state.  It usually takes no more than
         // one byte's worth of clocks, so 9 clocks.
-        accel->clear_i2c();
-        
+        // Release the I2C peripheral and timers before replacing the object.
+        // In Mbed CE, running timers also hold a deep-sleep lock.
+        accel->~Accel();
+        clear_i2c();
+
         // re-construct the Accel object
         new (accel) Accel(config);
 
@@ -4388,16 +4412,29 @@ public:
         // clear the center point
         cx_ = cy_ = 0;
         
-        // start the auto-centering timer
+        // Restart the centering history and filters after a sensor reset.
+        tCenter_.reset();
         tCenter_.start();
         iAccPrv_ = nAccPrv_ = 0;
-        
-        // reset and initialize the MMA8451Q
-        mma_.init();
-        
-        // set the range
+        for (int i = 0; i < maxAccPrv; ++i)
+            accPrv_[i] = AccHist();
+        dcFilterX_ = DCFilterState();
+        dcFilterY_ = DCFilterState();
+
+        // Reset and configure once. A failed transaction leaves the sensor
+        // unavailable until a later recovery attempt.
         int rangeInG = range_ == AccelRange4G ? 4 : range_ == AccelRange8G ? 8 : 2;
-        mma_.setRange(rangeInG);
+        sensorOK_ = mma_.init() && mma_.setRange(rangeInG);
+
+        // The full scale the *reports* use, which is not always the chip's.
+        // AccelRange1G runs the hardware at 2 g and halves the reported values,
+        // so a host told "2" would be wrong by a factor of two. This is the
+        // figure that gives the axis values their meaning, so it is the one
+        // published on the Open Pinball Device interface.
+        reportedRangeInG_ =
+            range_ == AccelRange1G ? 1 :
+            range_ == AccelRange2G ? 2 :
+            range_ == AccelRange4G ? 4 : 8;
                 
         // set the average accumulators to zero
         xSum_ = ySum_ = 0;
@@ -4422,14 +4459,27 @@ public:
         const float velocityDecayTime = 2.0f;  // time in seconds
         velocityDecayFactor_ = powf(0.5f, velocityDecayTime / sampleRate);
 
-        // read the current registers to clear the data ready flag
-        mma_.getAccXYZ(ax_, ay_, az_);
-        
+        // Start neutral, including when the first hardware read fails.
+        lastReportX_ = lastReportY_ = 0;
+        ax_ = ay_ = az_ = 0;
+        if (sensorOK_)
+            sensorOK_ = mma_.getAccXYZ(ax_, ay_, az_);
+        lastResetAttempt_ = us_ticker_read();
+
         // start the FIFO timer
         fifoTimer.reset();
         fifoTimer.start();
         tLastSample = tLastChangedSample = fifoTimer.read_us();
     }
+
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    void reportNudgeDiagnostics() const
+    {
+        printf("Nudge sensor: ready=%u raw=%d,%d,%d center=%d,%d report=%d,%d age_us=%lu\r\n",
+            unsigned(sensorOK_), ax_, ay_, az_, cx_, cy_, lastReportX_, lastReportY_,
+            static_cast<unsigned long>(uint32_t(fifoTimer.read_us() - tLastSample)));
+    }
+#endif
 
     // get the current velocity readings
     int getVX() const { return scaleVelocityOutput(vx_); }
@@ -4441,12 +4491,20 @@ public:
     // object if the device is wedged.
     bool poll()
     {
-        // read samples until we clear the FIFO
-        while (mma_.getFIFOCount() != 0)
+        if (!sensorOK_)
+            return false;
+
+        // Snapshot the FIFO count: at most 32 samples per poll. An endless
+        // stream (or stuck status register) must not trap the main loop.
+        int count = mma_.getFIFOCount();
+        if (count < 0)
+            return sensorFault();
+        for (int i = 0; i < count; ++i)
         {
-            // read the raw data
+            // Only publish complete, successful readings.
             int x, y, z;
-            mma_.getAccXYZ(x, y, z);
+            if (!mma_.getAccXYZ(x, y, z))
+                return sensorFault();
             
             // note the time
             tLastSample = fifoTimer.read_us();
@@ -4514,7 +4572,7 @@ public:
             || static_cast<uint32_t>(tNow - tLastChangedSample) > 2000000) // 2 seconds
         {
             // appears to be wedged
-            return false;
+            return sensorFault();
         }
         
         // okay
@@ -4530,8 +4588,20 @@ public:
     // time of last *different* sample from FIFO
     uint32_t tLastChangedSample;
     
-    void get(int &x, int &y) 
+    // Full scale of the reported acceleration axes, in g. See reset().
+    uint8_t reportedRangeInG() const { return reportedRangeInG_; }
+
+    void get(int &x, int &y)
     {
+        // USB reports can run faster than the sensor. Reuse the last report
+        // without dividing by zero or adding stale samples to calibration.
+        if (nSum_ == 0)
+        {
+            x = lastReportX_;
+            y = lastReportY_;
+            return;
+        }
+
         // read the shared data and store locally for calculations
         int ax = ax_, ay = ay_;
         int xSum = xSum_, ySum = ySum_;
@@ -4601,9 +4671,9 @@ public:
             tCenter_.reset();
         }
          
-        // report our integrated velocity reading in x,y
-        x = rawToReport(xSum/nSum);
-        y = rawToReport(ySum/nSum);
+        // Report and retain the average acceleration for empty reads.
+        x = lastReportX_ = rawToReport(xSum/nSum);
+        y = lastReportY_ = rawToReport(ySum/nSum);
          
 #ifdef DEBUG_PRINTF
         if (x != 0 || y != 0)        
@@ -4612,6 +4682,15 @@ public:
     }    
          
 private:
+    bool sensorFault()
+    {
+        sensorOK_ = false;
+        xSum_ = ySum_ = nSum_ = 0;
+        lastReportX_ = lastReportY_ = 0;
+        vx_ = vy_ = 0;
+        return false;
+    }
+
     // adjust a raw acceleration figure to a usb report value
     int rawToReport(int v)
     {
@@ -4648,6 +4727,9 @@ private:
 
     // underlying accelerometer object
     MMA8451Q mma_;
+    bool sensorOK_;
+    uint32_t lastResetAttempt_;
+    int lastReportX_, lastReportY_;
     
     // last raw acceleration readings, on the device's signed 14-bit 
     // scale -8192..+8191
@@ -4707,7 +4789,11 @@ private:
     float velocityScalingFactor_;
     
     // range (AccelRangeXxx value, from config.h)
-    uint8_t range_;
+    uint8_t range_ = AccelRange1G;
+
+    // Reported full scale in g, which is not the hardware range in the 1 g
+    // mode. Set in reset(), beside the chip configuration it derives from.
+    uint8_t reportedRangeInG_ = 1;
     
     // auto-center mode: 
     //   0 = default of 5-second auto-centering
@@ -5367,7 +5453,7 @@ bool saveConfigToFlash(int tFollowup, bool reboot)
 // that it's empty by virtue of not containing the required '66' byte
 // prefix for the first 8-byte variable block.
 static const uint8_t hostLoadedConfig[8192+32]
-    __attribute__ ((aligned(SECTOR_SIZE))) =
+    __attribute__ ((aligned(SECTOR_SIZE), used)) =
     "///Pinscape.HostLoadedConfig//\0\040";   // 30 byte signature + 2 byte length
 
 // Get a pointer to the first byte of the configuration data
@@ -5375,7 +5461,15 @@ const uint8_t *getHostLoadedConfigData()
 {
     // the first configuration variable byte immediately follows the
     // 32-byte signature header
-    return hostLoadedConfig + 32;
+    //
+    // The same barrier as getOpenSDAID(), for the same reason and with more at
+    // stake.  Without it GCC sees a const array it knows to be zero, concludes
+    // the '== 66' test in loadHostLoadedConfig() can never be true, drops the
+    // loop, then drops the 8 KB array itself as unreferenced -- so the config
+    // signature vanished from the .bin and the host had nowhere to write.
+    const uint8_t *p = hostLoadedConfig + 32;
+    __asm__ volatile ("" : "+r"(p));
+    return p;
 };
 
 // forward reference to config var store function
@@ -5390,9 +5484,15 @@ void loadHostLoadedConfig()
     // the USB protocol, so each block starts with a byte value of
     // 66 and is 8 bytes long.  Continue as long as we find valid
     // variable blocks, or reach end end of the block.
-    const uint8_t *start = getHostLoadedConfigData();
+    //
+    // Note: the bounds test compares the pointer that actually moves.  This
+    // read used to test 'start < end' with a 'start' that never advanced, so
+    // it could never fail and the loop stopped only on finding a byte that is
+    // not 66.  That holds while the area has room to spare -- the unused tail
+    // is zeroed, which ends the loop -- but filling all 1024 slots would let
+    // it run off the end of the array.  Require a whole record to remain.
     const uint8_t *end = hostLoadedConfig + sizeof(hostLoadedConfig);
-    for (const uint8_t *p = getHostLoadedConfigData() ; start < end && *p == 66 ; p += 8)
+    for (const uint8_t *p = getHostLoadedConfigData() ; p + 8 <= end && *p == 66 ; p += 8)
     {
         // load this variable
         configVarSet(p);
@@ -5416,7 +5516,7 @@ uint8_t tReportPlungerStat;     // timestamp of most recent plunger status reque
 //
 
 // Turn night mode on or off
-static void setNightMode(bool on)
+void setNightMode(bool on)
 {
     // Set the new night mode flag in the noisy output class.  Note
     // that we use the status report bit flag value 0x02 when on, so
@@ -5440,7 +5540,7 @@ static void setNightMode(bool on)
 }
 
 // Toggle night mode
-static void toggleNightMode()
+void toggleNightMode()
 {
     setNightMode(!nightMode);
 }
@@ -7051,11 +7151,13 @@ void handleInputMsg(LedWizMsg &lwm, USBJoystick &js, Accel &accel)
 // the USB connection for incoming LedWiz commands and process those into
 // port outputs.
 //
+#ifdef PINSCAPE_CRASH_DIAGNOSTICS
+void reportStartupMemory(const char *stage);
+void initCrashConsole(const Config &config);
+#endif
+
 int main(void)
 {
-    // say hello to the debug console, in case it's connected
-    printf("\r\nPinscape Controller starting\r\n");
-    
     // clear the I2C connection
     Accel::clear_i2c();
     
@@ -7098,6 +7200,14 @@ int main(void)
     if (!loadConfigFromFlash())
         loadHostLoadedConfig();
 
+#ifdef PINSCAPE_CRASH_DIAGNOSTICS
+    // Even diagnostics must not claim UART pins assigned to cabinet hardware.
+    // Initialize stdout before the custom heap is used by device allocations.
+    initCrashConsole(cfg);
+    printf("\r\nPinscape Controller starting\r\n");
+    printf("Crash diagnostics enabled (OpenSDA, 115200 baud)\r\n");
+#endif
+
     // set the default GPIO PWM period from the configuration
     NewPwmUnit::defaultPeriod = 1.0f / static_cast<float>(cfg.gpioPwmFreq == 0 ? 20000 : cfg.gpioPwmFreq);
             
@@ -7107,6 +7217,11 @@ int main(void)
     // we're not connected/awake yet
     bool connected = false;
     Timer connectChangeTimer;
+
+#ifdef PINSCAPE_CRASH_DIAGNOSTICS
+    printf("Plunger config: enabled=%u, type=%u\r\n",
+        unsigned(cfg.plunger.enabled), unsigned(cfg.plunger.sensorType));
+#endif
 
     // create the plunger sensor interface
     createPlunger();
@@ -7147,6 +7262,9 @@ int main(void)
 
     // initialize the button input ports
     initButtons(cfg, kbKeys);
+#ifdef PINSCAPE_CRASH_DIAGNOSTICS
+    reportStartupMemory("buttons ready");
+#endif
     
     // Create the joystick USB client.  Note that the USB vendor/product ID
     // information comes from the saved configuration.  Also note that we have
@@ -7154,8 +7272,11 @@ int main(void)
     // above) to set up the interface, since the button setup will determine
     // whether or not we need to present a USB keyboard interface in addition
     // to the joystick interface.
-    MyUSBJoystick js(cfg.usbVendorID, cfg.usbProductID, USB_VERSION_NO, false, 
+    MyUSBJoystick js(cfg.usbVendorID, cfg.usbProductID, USB_VERSION_NO, false,
         cfg.joystickEnabled, cfg.joystickAxisFormat, kbKeys);
+#ifdef PINSCAPE_CRASH_DIAGNOSTICS
+    reportStartupMemory("USB ready");
+#endif
         
     // start the request timestamp timer
     requestTimestamper.start();
@@ -7167,6 +7288,9 @@ int main(void)
     connFlashTimer.start();
     while (!js.configured())
     {
+        // Enumeration can suspend before the first successful connection.
+        js.recoverConnection();
+
         // show one short yellow flash at 2-second intervals
         if (connFlashTimer.read_us() > 2000000)
         {
@@ -7293,6 +7417,10 @@ int main(void)
     // start the PWM update polling timer
     polledPwmTimer.start();
     
+#ifdef PINSCAPE_CRASH_DIAGNOSTICS
+    reportStartupMemory("main loop ready");
+#endif
+
     // we're all set up - now just loop, processing sensor reports and 
     // host requests
     for (;;)
@@ -7308,7 +7436,7 @@ int main(void)
         Timer lwt;
         lwt.start();
         IF_DIAG(int msgCount = 0;) 
-        while (js.readLedWizMsg(lwm) && lwt.read_us() < 5000)
+        while (lwt.read_us() < 5000 && js.readLedWizMsg(lwm))
         {
             handleInputMsg(lwm, js, accel);
             IF_DIAG(++msgCount;)
@@ -7489,21 +7617,14 @@ int main(void)
         // collect diagnostic statistics, checkpoint 5
         IF_DIAG(mainLoopIterCheckpt[5] += mainLoopTimer.read_us();)
 
-        // send a keyboard report if we have new data
-        if (kbState.changed)
-        {
-            // send a keyboard report
-            js.kbUpdate(kbState.data);
+        // Keyboard and media reports share an endpoint. Keep each update
+        // pending until USB accepts it, including key releases.
+        if ((kbState.changed || (!mediaState.changed && js.kbIdleExpired()))
+            && js.kbUpdate(kbState.data))
             kbState.changed = false;
-        }
-        
-        // likewise for the media controller
-        if (mediaState.changed)
-        {
-            // send a media report
-            js.mediaUpdate(mediaState.data);
+
+        if ((mediaState.changed || js.mediaIdleExpired()) && js.mediaUpdate(mediaState.data))
             mediaState.changed = false;
-        }
         
         // collect diagnostic statistics, checkpoint 6
         IF_DIAG(mainLoopIterCheckpt[6] += mainLoopTimer.read_us();)
@@ -7596,6 +7717,31 @@ int main(void)
             {
                 // send the joystick report
                 jsOK = js.update(x, y, zReported, z0Reported, vx, vy, zvReported, jsButtons, statusFlags);
+
+                // Open Pinball Device carries the same measurements on its own
+                // interface, in the layout its specification fixes, so software
+                // reading it needs to know nothing about this board. It is sent
+                // on the same cadence as the joystick report: the readings are
+                // the same ones, and halving the rate of either would show up
+                // as lag in the simulator's physics.
+                //
+                // The button fields stay empty for now. OPD assigns meanings to
+                // its pinball buttons -- Start, Coin, MagnaSave and the rest --
+                // and mapping Pinscape's configurable button table onto them is
+                // a separate piece of work from carrying the axes.
+                if (js.opdEnabled())
+                {
+                    // OPD defines full retraction as +32767, versus +JOYMAX
+                    // on the joystick. Use the same scale for forward travel
+                    // and keep the resting position at zero.
+                    const int16_t opdPlungerPos = static_cast<int16_t>(
+                        static_cast<int32_t>(zReported) * 32767 / JOYMAX);
+                    js.sendOPD(0, 0,
+                               static_cast<int16_t>(x), static_cast<int16_t>(y),
+                               static_cast<int16_t>(vx), static_cast<int16_t>(vy),
+                               opdPlungerPos,
+                               static_cast<int16_t>(zvReported));
+                }
             }
             
             // we've just started a new report interval, so reset the timer
@@ -7649,6 +7795,18 @@ int main(void)
             jsOKTimer.reset();
             jsOKTimer.start();
         }
+
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+        // This adds serial latency intentionally in bench-test images only.
+        // Print outside interrupts and no more than once per second.
+        static uint32_t lastNudgeLog = 0;
+        if (uint32_t(us_ticker_read() - lastNudgeLog) >= 1000000)
+        {
+            lastNudgeLog = us_ticker_read();
+            accel.reportNudgeDiagnostics();
+            js.reportNudgeDiagnostics();
+        }
+#endif
 
         // collect diagnostic statistics, checkpoint 7
         IF_DIAG(mainLoopIterCheckpt[7] += mainLoopTimer.read_us();)
@@ -7812,6 +7970,10 @@ int main(void)
             // if we made it out of that loop alive, we're connected again!
             connected = true;
             HAL_DEBUG_PRINTEVENTS(">C");
+
+            // The disconnect might have aborted an accepted keyboard report.
+            // Send the current states again, even if no button has changed.
+            kbState.changed = mediaState.changed = kbKeys;
 
             // Enable peripheral chips and update them with current output data
             if (tlc5940 != 0)

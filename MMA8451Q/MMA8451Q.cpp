@@ -86,177 +86,206 @@
 #define INT_CFG_DRDY      0x01
 
 
-MMA8451Q::MMA8451Q(PinName sda, PinName scl, int addr) : m_i2c(sda, scl), m_addr(addr) 
+MMA8451Q::MMA8451Q(PinName sda, PinName scl, int addr, bool initialize) : m_i2c(sda, scl), m_addr(addr)
 {
     // set the I2C to fast mode
     m_i2c.frequency(400000);
 
     // initialize parameters
-    init();
+    if (initialize)
+        init();
 }
 
 // reset the accelerometer and set our parameters
-void MMA8451Q::init()
+bool MMA8451Q::init()
 {    
     // reset all registers to power-on reset values
     uint8_t d0[2] = { REG_CTRL_REG2, 0x40 };
-    writeRegs(d0,2 );
+    if (!writeRegs(d0, 2))
+        return false;
     
+    // Allow the device's I2C logic to restart before reading its status.
+    // NXP recommends 1 ms following software reset:
+    // https://community.nxp.com/t5/Sensors/MMA8451-Interrupts-and-Reset-Behavior/td-p/821096
+    wait_us(1000);
+
     // wait for the reset bit to clear
-    do {
-        readRegs(REG_CTRL_REG2, d0, 1);
-    } while ((d0[0] & 0x40) != 0);
+    if (!waitForClear(REG_CTRL_REG2, 0x40))
+        return false;
     
     // go to standby mode
-    standby();
+    if (!standby())
+        return false;
     
     // turn off FIFO mode - this is required before changing the F_READ bit
-    readRegs(REG_F_SETUP, d0, 1);
     uint8_t d0a[2] = { REG_F_SETUP, 0 };
-    writeRegs(d0a, 2);
+    if (!writeRegs(d0a, 2))
+        return false;
     
     // read the curent config register
     uint8_t d1[1];
-    readRegs(XYZ_DATA_CFG_REG, d1, 1);
+    if (!readRegs(XYZ_DATA_CFG_REG, d1, 1))
+        return false;
     
     // set 2g mode by default
     uint8_t d2[2] = { XYZ_DATA_CFG_REG, (d1[0] & ~FS_MASK) | FS_2G };
-    writeRegs(d2, 2);
+    if (!writeRegs(d2, 2))
+        return false;
     
     // read the ctl2 register
     uint8_t d3[1];
-    readRegs(REG_CTRL_REG2, d3, 1);
+    if (!readRegs(REG_CTRL_REG2, d3, 1))
+        return false;
     
     // set the high resolution mode
     uint8_t d4[2] = {REG_CTRL_REG2, (d3[0] & ~MODS_MASK) | MODS_HI_RES};
-    writeRegs(d4, 2);
+    if (!writeRegs(d4, 2))
+        return false;
     
     // set 800 Hz mode, 14-bit data (clear the F_READ bit)
     uint8_t d5[1];
-    readRegs(REG_CTRL_REG1, d5, 1);
+    if (!readRegs(REG_CTRL_REG1, d5, 1))
+        return false;
     uint8_t d6[2] = {REG_CTRL_REG1, (d5[0] & ~(DR_MASK | F_READ_MASK)) | DR_800_HZ};
-    writeRegs(d6, 2);
+    if (!writeRegs(d6, 2))
+        return false;
     
     // set circular FIFO mode
     uint8_t d7[1];
-    readRegs(REG_F_SETUP, d7, 1);
+    if (!readRegs(REG_F_SETUP, d7, 1))
+        return false;
     uint8_t d8[2] = {REG_F_SETUP, (d7[0] & ~F_MODE_MASK) | F_MODE_CIRC};
-    writeRegs(d8, 2);
+    if (!writeRegs(d8, 2))
+        return false;
 
     // enter active mode
-    active();
+    return active();
 }
 
 MMA8451Q::~MMA8451Q() { }
 
 bool MMA8451Q::sampleReady()
 {
-    uint8_t d[1];
-    readRegs(REG_F_STATUS, d, 1);
-    return (d[0] & F_STATUS_XYZDR_MASK) == F_STATUS_XYZDR_MASK;
+    uint8_t d;
+    return readRegs(REG_F_STATUS, &d, 1)
+        && (d & F_STATUS_XYZDR_MASK) == F_STATUS_XYZDR_MASK;
 }
 
 int MMA8451Q::getFIFOCount()
 {
-    uint8_t d[1];
-    readRegs(REG_F_STATUS, d, 1);
-    return d[0] & F_STATUS_CNT_MASK;
+    uint8_t d;
+    if (!readRegs(REG_F_STATUS, &d, 1))
+        return -1;
+    int count = d & F_STATUS_CNT_MASK;
+    return count <= 32 ? count : -1;
 }
 
-void MMA8451Q::setInterruptMode(int pin)
+bool MMA8451Q::setInterruptMode(int pin)
 {
     // go to standby mode
-    standby();
+    if (!standby())
+        return false;
 
     // set IRQ push/pull and active high
     uint8_t d1[1];
-    readRegs(REG_CTRL_REG3, d1, 1);
+    if (!readRegs(REG_CTRL_REG3, d1, 1))
+        return false;
     uint8_t d2[2] = {
         REG_CTRL_REG3, 
         (d1[0] & ~CTRL_REG3_PPOD_MASK) | CTRL_REG3_IPOL_MASK
     };
-    writeRegs(d2, 2);
+    if (!writeRegs(d2, 2))
+        return false;
     
     // set pin 2 or pin 1
-    readRegs(REG_CTRL_REG5, d1, 1);
+    if (!readRegs(REG_CTRL_REG5, d1, 1))
+        return false;
     uint8_t d3[2] = { 
         REG_CTRL_REG5, 
         (d1[0] & ~INT_CFG_DRDY) | (pin == 1 ? INT_CFG_DRDY : 0)
     };
-    writeRegs(d3, 2);
+    if (!writeRegs(d3, 2))
+        return false;
     
     // enable data ready interrupt
-    readRegs(REG_CTRL_REG4, d1, 1);
+    if (!readRegs(REG_CTRL_REG4, d1, 1))
+        return false;
     uint8_t d4[2] = { REG_CTRL_REG4, d1[0] | INT_EN_DRDY };
-    writeRegs(d4, 2);
+    if (!writeRegs(d4, 2))
+        return false;
     
     // enter active mode
-    active();
+    return active();
 }
 
-void MMA8451Q::clearInterruptMode()
+bool MMA8451Q::clearInterruptMode()
 {
     // go to standby mode
-    standby();
+    if (!standby())
+        return false;
     
     // clear the interrupt register
     uint8_t d1[2] = { REG_CTRL_REG4, 0 };
-    writeRegs(d1, 2);
+    if (!writeRegs(d1, 2))
+        return false;
 
     // enter active mode
-    active();
+    return active();
 }
 
-void MMA8451Q::setRange(int g)
+bool MMA8451Q::setRange(int g)
 {
     // go to standby mode
-    standby();
+    if (!standby())
+        return false;
     
     // read the curent config register
     uint8_t d1[1];
-    readRegs(XYZ_DATA_CFG_REG, d1, 1);
+    if (!readRegs(XYZ_DATA_CFG_REG, d1, 1))
+        return false;
     
     // figure the mode flag for the desired G setting
     uint8_t mode = (g == 8 ? FS_8G : g == 4 ? FS_4G : FS_2G);
     
     // set new mode
     uint8_t d2[2] = { XYZ_DATA_CFG_REG, (d1[0] & ~FS_MASK) | mode };
-    writeRegs(d2, 2);
+    if (!writeRegs(d2, 2))
+        return false;
     
     // enter active mode
-    active();
+    return active();
 }
 
-void MMA8451Q::standby()
+bool MMA8451Q::standby()
 {
     // read the current control register
     uint8_t d1[1];
-    readRegs(REG_CTRL_REG1, d1, 1);
+    if (!readRegs(REG_CTRL_REG1, d1, 1))
+        return false;
     
-    // wait for standby mode
-    do {
-        // write it back with the Active bit cleared
-        uint8_t d2[2] = { REG_CTRL_REG1, d1[0] & ~CTL_ACTIVE };
-        writeRegs(d2, 2);
-    
-        readRegs(REG_CTRL_REG1, d1, 1);
-    } while (d1[0] & CTL_ACTIVE);
+    // Request standby once, then wait for acknowledgement with a deadline.
+    uint8_t d2[2] = { REG_CTRL_REG1, uint8_t(d1[0] & ~CTL_ACTIVE) };
+    if (!writeRegs(d2, 2))
+        return false;
+    return waitForClear(REG_CTRL_REG1, CTL_ACTIVE);
 }
 
-void MMA8451Q::active()
+bool MMA8451Q::active()
 {
     // read the current control register
     uint8_t d1[1];
-    readRegs(REG_CTRL_REG1, d1, 1);
+    if (!readRegs(REG_CTRL_REG1, d1, 1))
+        return false;
     
     // write it back out with the Active bit set
     uint8_t d2[2] = { REG_CTRL_REG1, d1[0] | CTL_ACTIVE };
-    writeRegs(d2, 2);
+    return writeRegs(d2, 2);
 }
 
 uint8_t MMA8451Q::getWhoAmI() {
     uint8_t who_am_i = 0;
-    readRegs(REG_WHO_AM_I, &who_am_i, 1);
+    if (!readRegs(REG_WHO_AM_I, &who_am_i, 1))
+        return 0;
     return who_am_i;
 }
 
@@ -264,11 +293,12 @@ float MMA8451Q::getAccX() {
     return (float(getAccAxis(REG_OUT_X_MSB))/4096.0);
 }
 
-void MMA8451Q::getAccXY(float &x, float &y) 
+bool MMA8451Q::getAccXY(float &x, float &y)
 {
     // read the X and Y output registers
     uint8_t res[4];
-    readRegs(REG_OUT_X_MSB, res, 4);
+    if (!readRegs(REG_OUT_X_MSB, res, 4))
+        return false;
     
     // translate the x value
     uint16_t acc = (res[0] << 8) | (res[1]);
@@ -277,13 +307,15 @@ void MMA8451Q::getAccXY(float &x, float &y)
     // translate the y value
     acc = (res[2] << 9) | (res[3]);
     y = int16_t(acc)/(4*4096.0);
+    return true;
 }
 
-void MMA8451Q::getAccXYZ(float &x, float &y, float &z)
+bool MMA8451Q::getAccXYZ(float &x, float &y, float &z)
 {
     // read the X, Y, and Z output registers
     uint8_t res[6];
-    readRegs(REG_OUT_X_MSB, res, 6);
+    if (!readRegs(REG_OUT_X_MSB, res, 6))
+        return false;
     
     // translate the x value
     uint16_t acc = (res[0] << 8) | (res[1]);
@@ -296,18 +328,21 @@ void MMA8451Q::getAccXYZ(float &x, float &y, float &z)
     // translate the z value
     acc = (res[4] << 8) | (res[5]);
     z = int16_t(acc)/(4*4096.0);
+    return true;
 }
 
-void MMA8451Q::getAccXYZ(int &x, int &y, int &z)
+bool MMA8451Q::getAccXYZ(int &x, int &y, int &z)
 {    
     // read the X, Y, and Z output registers
     uint8_t res[6];
-    readRegs(REG_OUT_X_MSB, res, 6);
+    if (!readRegs(REG_OUT_X_MSB, res, 6))
+        return false;
     
     // translate the register values
     x = xlat14(&res[0]);
     y = xlat14(&res[2]);
     z = xlat14(&res[4]);
+    return true;
 }
 
 float MMA8451Q::getAccY() {
@@ -327,7 +362,8 @@ void MMA8451Q::getAccAllAxis(float * res) {
 int16_t MMA8451Q::getAccAxis(uint8_t addr) {
     int16_t acc;
     uint8_t res[2];
-    readRegs(addr, res, 2);
+    if (!readRegs(addr, res, 2))
+        return 0;
 
     acc = (res[0] << 6) | (res[1] >> 2);
     if (acc > UINT14_MAX/2)
@@ -336,12 +372,47 @@ int16_t MMA8451Q::getAccAxis(uint8_t addr) {
     return acc;
 }
 
-void MMA8451Q::readRegs(int addr, uint8_t * data, int len) {
-    char t[1] = {addr};
-    m_i2c.write(m_addr, t, 1, true);
-    m_i2c.read(m_addr, (char *)data, len);
+// These register polls must not hold up the main loop indefinitely when a
+// sensor acknowledges I2C requests but never completes reset or standby.
+bool MMA8451Q::waitForClear(int addr, uint8_t mask)
+{
+    const uint32_t start = us_ticker_read();
+    do {
+        uint8_t value;
+        if (!readRegs(addr, &value, 1))
+            return false;
+        if ((value & mask) == 0)
+            return true;
+        wait_us(100);
+    } while (uint32_t(us_ticker_read() - start) < 10000);
+    return false;
 }
 
-void MMA8451Q::writeRegs(uint8_t * data, int len) {
-    m_i2c.write(m_addr, (char *)data, len);
+bool MMA8451Q::readRegs(int addr, uint8_t *data, int len)
+{
+    char reg = static_cast<char>(addr);
+    int rc = m_i2c.write(m_addr, &reg, 1, true);
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    if (rc != 0)
+        printf("Nudge I2C: select reg=%02X result=%d\r\n", unsigned(addr), rc);
+#endif
+    if (rc != 0)
+        return false;
+    rc = m_i2c.read(m_addr, reinterpret_cast<char *>(data), len);
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    if (rc != 0)
+        printf("Nudge I2C: read reg=%02X result=%d\r\n", unsigned(addr), rc);
+#endif
+    return rc == 0;
+}
+
+bool MMA8451Q::writeRegs(uint8_t *data, int len)
+{
+    int rc = m_i2c.write(m_addr, reinterpret_cast<char *>(data), len);
+#ifdef PINSCAPE_NUDGE_DIAGNOSTICS
+    if (rc != 0)
+        printf("Nudge I2C: write reg=%02X value=%02X result=%d\r\n",
+            unsigned(data[0]), unsigned(data[1]), rc);
+#endif
+    return rc == 0;
 }
